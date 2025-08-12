@@ -25,7 +25,42 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import re
+
+def _strip_js_comments(src: str) -> str:
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    src = re.sub(r"(^|\s)//.*?$", r"\1", src, flags=re.M)
+    return src
+
+def _ensure__to_id():
+    # Some repos define _to_id already; if not, provide a compatible fallback.
+    globals_ = globals()
+    if "_to_id" not in globals_:
+        def _to_id(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+        globals_["_to_id"] = _to_id
+
+def _load_js(path: str) -> Dict[str, Any]:
+    """Parse Showdown-style JS exports like `exports.Moves = { ... }`."""
+    _ensure__to_id()
+    with open(path, "r", encoding="utf-8") as f:
+        src = _strip_js_comments(f.read())
+    # Try to grab final object literal (covers `exports.X = {...};` and `const X = {...}`)
+    m = re.search(r"=\s*({.*})\s*;?\s*$", src, flags=re.S)
+    if not m:
+        # Fallback: last {...} block
+        m = re.search(r"({.*})\s*;?\s*$", src, flags=re.S)
+    if not m:
+        raise ValueError(f"Could not locate object literal in {path}")
+    obj = m.group(1)
+    # Remove trailing commas
+    obj = re.sub(r",(\s*[\]}])", r"\1", obj)
+    # Quote bare keys
+    obj2 = re.sub(r"([{\[,]\s*)([A-Za-z0-9_]+)\s*:", r'\1"\2":', obj)
+    import json as _json
+    data = _json.loads(obj2)
+    return { _to_id(k): v for k, v in data.items() }
 
 def _to_id(s: str) -> str:
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())

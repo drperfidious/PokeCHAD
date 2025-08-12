@@ -58,6 +58,13 @@ def _normalize_showdown_typechart(tc):
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+# Added by patch_think_showdown.py
+import os
+try:
+    from tools.Data.showdown.ps_data_loader import load_showdown_dir  # noqa: F401
+except Exception:
+    load_showdown_dir = None
+
 try:
     from poke_env.data import GenData
     from poke_env.data.normalize import to_id_str
@@ -95,31 +102,30 @@ class MoveInfo:
 
 
 class MovesInfo:
-    def get_type_chart(self):
-        """Return a normalized, uppercase type chart with caching."""
-        try:
-            tc = getattr(self, "_type_chart_cache", None)
-            if tc is None:
-                raw_tc = getattr(getattr(self, "_data", None), "type_chart", None) or getattr(self, "type_chart", None) or {}
-                tc = _normalize_showdown_typechart(raw_tc)
-                setattr(self, "_type_chart_cache", tc)
-            return tc
-        except Exception:
-            return {}
     def __init__(self, gen_or_format: Union[int, str] = 9):
         if isinstance(gen_or_format, int):
             self._data = GenData.from_gen(gen_or_format) if GenData else None
         else:
             self._data = GenData.from_format(gen_or_format) if GenData else None
+        # Load Showdown dex as a secondary source (items/abilities/moves/typechart)
+        self._ps_dex: Dict[str, Dict[str, Any]] = {}
+        try:
+            if load_showdown_dir:
+                repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                sd_dir = os.path.join(repo_root, "tools", "Data", "showdown")
+                if os.path.isdir(sd_dir):
+                    self._ps_dex = load_showdown_dir(sd_dir)
+        except Exception:
+            self._ps_dex = {}
 
-    @property
     def gen(self) -> int:
         return getattr(self._data, "gen", 9)
 
     def exists(self, name_or_id: str) -> bool:
-        if not self._data:
-            return False
-        return to_id_str(name_or_id) in self._data.moves
+        mid = to_id_str(name_or_id)
+        in_pokeenv = bool(getattr(self, "_data", None)) and (mid in getattr(self._data, "moves", {}))
+        in_ps = bool(self._ps_dex) and (mid in self._ps_dex.get("moves", {}))
+        return in_pokeenv or in_ps
 
     def all_ids(self) -> List[str]:
         if not self._data:
@@ -127,10 +133,15 @@ class MovesInfo:
         return list(self._data.moves.keys())
 
     def raw(self, name_or_id: str) -> Dict[str, Any]:
-        if not self._data:
-            raise RuntimeError("poke_env not available")
         mid = to_id_str(name_or_id)
-        m = self._data.moves.get(mid)
+        m = None
+        try:
+            if getattr(self, "_data", None):
+                m = self._data.moves.get(mid)
+        except Exception:
+            m = None
+        if m is None and self._ps_dex:
+            m = self._ps_dex.get("moves", {}).get(mid)
         if m is None:
             raise KeyError(f"Unknown move: {name_or_id} (normalized: {mid})")
         return m
@@ -143,7 +154,7 @@ class MovesInfo:
             name=m.get("name", mid),
             type=m.get("type"),
             category=m.get("category"),
-            base_power=m.get("basePower"),
+            base_power=m.get("basePower") if "basePower" in m else m.get("base_power"),
             accuracy=m.get("accuracy"),
             priority=m.get("priority", 0),
             target=m.get("target"),
@@ -152,52 +163,27 @@ class MovesInfo:
             secondary=m.get("secondary"),
             secondaries=m.get("secondaries"),
             status=m.get("status"),
-            volatile_status=m.get("volatileStatus"),
+            volatile_status=m.get("volatileStatus") or m.get("volatile_status"),
             boosts=m.get("boosts"),
             multihit=m.get("multihit"),
             drain=m.get("drain"),
             recoil=m.get("recoil"),
             raw=m,
         )
-def get_type_chart(self) -> Dict[str, Dict[str, float]]:
-    """Return a normalized, uppercase type chart mapping ATK->{DEF: multiplier}.
 
-    This is applied once at source so every downstream caller sees consistent data:
-    - Attack/Defense type names uppercased
-    - Multipliers coerced to float (0, 0.5, 1, 2, etc.)
-    - Odd dumps (True/False/None/strings) mapped to sane defaults
-    """
-    if not self._data:
-        return {}
-
-    raw_tc = getattr(self._data, "type_chart", {}) or {}
-    norm: Dict[str, Dict[str, float]] = {}
-
-    for atk, row in raw_tc.items():
-        if not isinstance(row, dict):
-            # Some older exports wrap rows differently; skip if malformed
-            continue
-        atk_u = str(atk).upper()
-        out: Dict[str, float] = {}
-
-        for d, mult in (row or {}).items():
-            d_u = str(d).upper()
-            try:
-                out[d_u] = float(mult)
-            except Exception:
-                # Robust coercion for quirky exports
-                if mult is True:
-                    out[d_u] = 1.0
-                elif mult in (False, 0, "0", "0.0", None):
-                    out[d_u] = 0.0
-                elif mult in ("0.5", ".5", "½"):
-                    out[d_u] = 0.5
-                elif mult in ("2", "2.0", "×2"):
-                    out[d_u] = 2.0
-                else:
-                    # Final fallback: neutral
-                    out[d_u] = 1.0
-
-        norm[atk_u] = out
-
-    return norm
+    def get_type_chart(self) -> Dict[str, Dict[str, float]]:
+        """Return a normalized, uppercase type chart with caching (falls back to Showdown)."""
+        try:
+            tc = getattr(self, "_type_chart_cache", None)
+            if tc is None:
+                raw_tc = (
+                    getattr(getattr(self, "_data", None), "type_chart", None)
+                    or getattr(self, "type_chart", None)
+                    or (self._ps_dex.get("typechart") if getattr(self, "_ps_dex", None) else {})
+                    or {}
+                )
+                tc = _normalize_showdown_typechart(raw_tc)
+                setattr(self, "_type_chart_cache", tc)
+            return tc
+        except Exception:
+            return {}
