@@ -1,0 +1,1787 @@
+from __future__ import annotations
+import json
+import os
+
+# --- BEGIN SAFE TYPE CHART HELPER ---
+_SAFE_GET_TYPE_CHART = True
+def _safe_get_type_chart(mi):
+    try:
+        return _safe_get_type_chart(mi)
+    except Exception:
+        pass
+    # fall back to any raw chart we can find
+    try:
+        raw_tc = getattr(mi, "type_chart", None)
+        if raw_tc is None:
+            data = getattr(mi, "_data", None)
+            raw_tc = getattr(data, "type_chart", None) if data is not None else None
+    except Exception:
+        raw_tc = None
+    # try to normalize like in Data/poke_env_moves_info
+    try:
+        from Data.poke_env_moves_info import _normalize_showdown_typechart  # type: ignore
+        return _normalize_showdown_typechart(raw_tc or {})
+    except Exception:
+        return raw_tc if isinstance(raw_tc, dict) else {}
+# --- END SAFE TYPE CHART HELPER ---
+
+
+
+
+
+from dataclasses import dataclass
+
+
+from typing import Any, Dict, List, Optional, Callable
+
+
+
+
+
+# Import mechanics from the Data package
+
+
+from Data.battle_runtime import (
+
+
+    get_state,
+
+
+    predict_order_for_ids,
+
+
+    estimate_damage,
+
+
+    would_fail,
+
+
+    apply_switch_in_effects,
+
+
+)
+
+
+from Data.poke_env_battle_environment import snapshot as snapshot_battle
+
+
+from Data.poke_env_moves_info import MovesInfo
+
+# --- learned weights (optional) --------------------------------------------
+def _load_weights(path: str = os.path.join("Models", "weights.json")) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            w = json.load(f)
+        # safe defaults
+        return {
+            "go_first_bonus": float(w.get("go_first_bonus", 0.4)),
+            "opp_dmg_penalty": float(w.get("opp_dmg_penalty", 1.0)),
+            "survival_bonus": float(w.get("survival_bonus", 0.0)),
+        }
+    except Exception:
+        return {"go_first_bonus": 0.4, "opp_dmg_penalty": 1.0, "survival_bonus": 0.0}
+
+
+
+
+
+
+# ---------------- helpers (local only) -----------------
+
+
+def _acc_to_prob(acc) -> float:
+
+
+    # poke-env accuracy can be True (100), int 0..100, float 0..1
+
+
+    if acc is True:
+
+
+        return 1.0
+
+
+    if acc is None:
+
+
+        return 1.0
+
+
+    try:
+
+
+        x = float(acc)
+
+
+        return x / 100.0 if x > 1.0 else max(0.0, min(1.0, x))
+
+
+    except Exception:
+
+
+        return 1.0
+
+
+
+
+
+def _type_mult(att_type: str, defender_types, chart: Dict[str, Dict[str, float]]) -> float:
+    """Calculate type effectiveness multiplier correctly handling case sensitivity."""
+    if not chart or not att_type or not defender_types:
+        return 1.0
+
+    # Normalize type names to match chart keys (usually UPPERCASE)
+    chart_keys = set(chart.keys())
+    att_type_norm = None
+
+    # Find the correct case for the attack type in the chart
+    for key in chart_keys:
+        if key.upper() == att_type.upper():
+            att_type_norm = key
+            break
+
+    if not att_type_norm:
+        return 1.0
+
+    mult = 1.0
+    for def_type in defender_types:
+        if not def_type:
+            continue
+
+        # Find the correct case for the defense type
+        def_type_norm = None
+        for target_key in chart[att_type_norm]:
+            if target_key.upper() == def_type.upper():
+                def_type_norm = target_key
+                break
+
+        if def_type_norm:
+            effectiveness = chart[att_type_norm][def_type_norm]
+            mult *= effectiveness
+
+    return mult
+
+
+
+
+
+# ---------------- Public data container -----------------
+
+
+@dataclass
+
+
+class ChosenAction:
+
+
+    kind: str  # 'move' | 'switch'
+
+
+    move_id: Optional[str] = None
+
+
+    switch_species: Optional[str] = None
+
+
+    debug: Dict[str, Any] | None = None
+
+
+
+
+
+# ----------------- Core engine --------------------------
+
+
+class StockfishModel:
+
+
+    def __init__(self, battle_format: str = 'gen9ou'):
+
+
+        self.battle_format = battle_format
+
+
+        self._W = _load_weights()
+        # configurable 'depth' knob the UI may tweak; we don't tree-search but keep it as a param
+
+
+        self._depth = 3
+
+
+
+
+
+    def set_depth(self, d: int):
+
+
+        self._depth = int(d)
+
+
+
+
+
+    def choose_action(self, battle: Any) -> ChosenAction:
+
+
+        """Return ChosenAction and rich debug info for the UI."""
+
+
+        state = get_state(battle)
+
+
+        mi = MovesInfo(state.format or 9)
+        type_chart = _safe_get_type_chart(mi)
+        print(f"DEBUG: MovesInfo format: {state.format or 9}")
+        print(f"DEBUG: Type chart size: {len(type_chart) if type_chart else 0}")
+        if type_chart:
+            print(f"DEBUG: Sample types: {list(type_chart.keys())[:5]}")
+        print(f"DEBUG: MovesInfo initialized with format: {state.format or 9}")
+        print(f"DEBUG: Type chart loaded: {bool(_safe_get_type_chart(mi))}")
+
+
+
+
+
+        # Determine active slots for both sides
+
+
+        def _active_key(side: Dict[str, Any]) -> Optional[str]:
+
+
+            for k, p in side.items():
+
+
+                if getattr(p, 'is_active', False):
+
+
+                    return k
+
+
+            for k, p in side.items():
+
+
+                if (getattr(p, 'status', None) or '').lower() == 'fnt':
+
+
+                    continue
+
+
+                chp = getattr(p, 'current_hp', None)
+
+
+                if chp is None:
+
+
+                    return k
+
+
+                if chp > 0:
+
+
+                    return k
+
+
+            return None
+
+
+
+
+
+        my_key = _active_key(state.team.ours) if getattr(state, 'team', None) else None
+
+
+        opp_key = _active_key(state.team.opponent) if getattr(state, 'team', None) else None
+
+
+
+
+
+        legal_moves = list(getattr(battle, 'available_moves', []) or [])
+
+
+        legal_switches = list(getattr(battle, 'available_switches', []) or [])
+
+
+        force_switch = bool(getattr(battle, 'force_switch', False)) or (not legal_moves and bool(legal_switches))
+
+
+
+
+
+        # Reveal opponent move ids if we know them; give a safe default
+
+
+        opp_moves_known = []
+
+
+        try:
+
+
+            if opp_key:
+
+
+                opp_ps = state.team.opponent[opp_key]
+
+
+                opp_moves_known = [m.id for m in (opp_ps.moves or []) if getattr(m, "id", None)]
+
+
+        except Exception:
+
+
+            pass
+
+
+        default_opp_move = opp_moves_known[0] if opp_moves_known else "tackle"
+
+
+
+
+
+        # ---- Evaluate MOVES ---------------------------------------------------
+
+
+        moves_eval: List[Dict[str, Any]] = []
+
+
+        if not force_switch and my_key and opp_key:
+
+
+            opp_ps = state.team.opponent[opp_key]
+
+
+            opp_max = int(getattr(opp_ps, 'max_hp', 0) or opp_ps.stats.raw.get('hp', 1) or 1)
+
+
+            for mv in legal_moves:
+
+
+                mid = getattr(mv, 'id', None) or getattr(mv, 'move_id', None)
+
+
+                name = getattr(mv, 'name', str(mid))
+
+
+                if not mid:
+
+
+                    continue
+
+
+
+
+
+                # Filter out immediate failure (eg. sleep talk while awake)
+
+
+                fail, why = False, None
+
+
+                try:
+
+
+                    fail, why = would_fail(str(mid), my_key, opp_key, state, mi)
+
+
+                except Exception:
+
+
+                    pass
+
+
+                if fail:
+                    moves_eval.append({
+                            'id': str(mid), 'name': name,
+                            'score': 0.0,
+                            'expected': 0.0, 'exp_dmg': 0.0,
+                            'acc_mult': 0.0, 'acc': 0.0,
+                            'effectiveness': 0.0, 'eff': 0.0,
+                            'why_blocked': str(why or 'would fail')
+                    })
+                    continue
+
+
+
+
+
+                try:
+
+
+                    dmg = estimate_damage(state, my_key, opp_key, str(mid), mi)
+
+
+                    rolls = list(dmg.get('rolls', []) or [])
+
+
+                    avg = sum(rolls) / len(rolls) if rolls else 0.0
+
+
+                    eff = float(dmg.get('effectiveness', 1.0) or 1.0)
+                    # Use recalculated effectiveness from _type_mult if available
+                    move_raw = mi.raw(str(mid))
+                    if move_raw:
+                        move_type = move_raw.get("type", "")
+                        def_types = getattr(state.team.opponent[opp_key], "types", [])
+                        if move_type and def_types and type_chart:
+                            eff = _type_mult(move_type, def_types, type_chart)
+
+                    # Debug type effectiveness
+                    move_raw = mi.raw(str(mid))
+                    if move_raw:
+                        move_type = move_raw.get("type", "unknown")
+                        def_types = getattr(state.team.opponent[opp_key], "types", [])
+                        print(f"DEBUG: Move {mid} ({move_type}) vs {def_types} = {eff}x effectiveness")
+
+                        # Recalculate effectiveness if we have type info
+                        if move_type != "unknown" and def_types and type_chart:
+                            recalc_eff = _type_mult(move_type, def_types, type_chart)
+                            if abs(recalc_eff - eff) > 0.01:
+                                                                eff = recalc_eff
+                    print(f"DEBUG: Move {mid} effectiveness: {eff}, damage rolls: {rolls}")
+                    # Show move type information
+                    move_raw = mi.raw(str(mid))
+                    move_type = move_raw.get("type", "unknown") if move_raw else "unknown"
+                    print(f"DEBUG: Move {mid} type: {move_type}")
+                    # Show defender types
+                    opp_types = getattr(state.team.opponent[opp_key], "types", [])
+                    print(f"DEBUG: Defender {opp_key} types: {opp_types}")
+
+                    acc_p = _acc_to_prob(getattr(mv, 'accuracy', 1.0))
+
+
+                    # chance to move first (priority/speed); use default opp move if unknown
+
+
+                    try:
+                        first_prob, _ = predict_order_for_ids(state, my_key, str(mid), opp_key,
+                                                                                       default_opp_move, mi)
+                    except Exception:
+                      # Neutral fallback so UI rows don't collapse when order prediction fails
+                        first_prob = 0.5
+
+
+                    expected = (avg / float(opp_max)) * acc_p
+
+
+                    # mild emphasis on moving first, but don't double-count type (already in rolls)
+
+
+                    score = expected * (0.6 + 0.4 * float(first_prob))
+
+  # Fill both "new" and "legacy" keys the UI knows how to read
+                    moves_eval.append({
+                            'id': str(mid), 'name': name,
+                            'score': float(score),
+                            'expected': float(expected), 'exp_dmg': float(expected),
+    # alias for UI
+                            'acc_mult': float(acc_p), 'acc': float(acc_p),  # alias for UI
+                            'effectiveness': float(eff), 'eff': float(eff),  # alias for UI
+                            'first_prob': float(first_prob),
+                    })
+
+                except Exception as e:
+
+                    moves_eval.append({
+
+                            'id': str(mid), 'name': name,
+
+                            'score': 0.0,
+
+                            'expected': 0.0, 'exp_dmg': 0.0,
+
+                            'acc_mult': 0.0, 'acc': 0.0,
+
+                            'effectiveness': 0.0, 'eff': 0.0,
+
+                            'note': f'err: {e}',
+
+                    })
+
+
+            moves_eval.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+
+
+
+
+
+        # ---- Evaluate SWITCHES -----------------------------------------------
+
+
+        switches_eval: List[Dict[str, Any]] = []
+
+
+        if legal_switches and opp_key:
+
+
+            chart = _safe_get_type_chart(mi)
+
+
+            # Current active (for risk comparison if we stay)
+
+
+            stay_incoming = 0.0
+
+
+            try:
+
+
+                # worst revealed incoming against current active
+
+
+                if my_key and opp_moves_known:
+
+
+                    my_ps = state.team.ours[my_key]
+
+
+                    my_max = float(my_ps.max_hp or my_ps.stats.raw.get("hp", 1) or 1)
+
+
+                    worst = 0.0
+
+
+                    for om in opp_moves_known:
+
+
+                        d = estimate_damage(state, opp_key, my_key, str(om), mi)
+
+
+                        rr = d.get('rolls', []) or []
+
+
+                        if rr:
+
+
+                            worst = max(worst, sum(rr)/len(rr))
+
+
+                    stay_incoming = worst / my_max
+
+
+            except Exception:
+
+
+                pass
+
+
+
+
+
+            # Bench options
+
+
+            my_species_active = None
+
+
+            try:
+
+
+                if my_key:
+
+
+                    my_species_active = str(getattr(state.team.ours[my_key], "species", "") or "").lower()
+
+
+            except Exception:
+
+
+                pass
+
+
+
+
+
+            for p in legal_switches:
+
+
+                species = str(getattr(p, 'species', '') or '')
+                print(f"DEBUG: Evaluating switch to {species}")
+
+                if species.lower() == (my_species_active or ""):
+
+
+                    # Never try to switch to the active mon
+
+
+                    print(f"DEBUG: Skipping {species} - already active")
+
+
+                    continue
+
+
+
+
+
+                # Find this species' key in our TeamState (best-effort, prefer non-active)
+
+
+                tmp_state = get_state(battle)
+
+
+                cand_key = None
+
+
+                for k, ps in tmp_state.team.ours.items():
+
+
+                    if str(getattr(ps, 'species', '')).lower() == species.lower() and not getattr(ps, "is_active", False):
+
+
+                        cand_key = k
+
+
+                        break
+
+
+                if cand_key is None:
+
+
+                    # fallback: first matching by species
+
+
+                    for k, ps in tmp_state.team.ours.items():
+
+
+                        if str(getattr(ps, 'species', '')).lower() == species.lower():
+
+
+                            cand_key = k
+
+
+                            break
+
+
+                if cand_key is None:
+
+
+                    # give up gracefully
+
+
+                    print(f"DEBUG: No key found for {species}")
+
+
+                    switches_eval.append({'species': species, 'score': 0.0, 'hp_fraction': float(getattr(p, 'current_hp_fraction', 1.0) or 1.0), 'note': 'no-key'})
+
+
+                    continue
+
+
+
+
+
+                print(f"DEBUG: Found key {cand_key} for {species}")
+
+
+                # Hazard + Sticky Web effects on switch-in (no mutation)
+
+
+                haz = apply_switch_in_effects(tmp_state, cand_key, "ally", mi, mutate=False)
+
+
+                haz_frac = float(haz.get("fraction_lost") or 0.0)
+
+
+                print(f"DEBUG: Hazard damage for {species}: {haz_frac:.3f}")
+
+
+
+
+
+                # Expected incoming this turn if we switch (opponent attacks the switch-in)
+
+
+                cand_ps = tmp_state.team.ours[cand_key]
+
+
+                cand_max = float(cand_ps.max_hp or cand_ps.stats.raw.get("hp", 1) or 1)
+
+
+                incoming = 0.0
+
+
+                try:
+
+
+                    worst = 0.0
+
+
+                    test_moves = opp_moves_known or [default_opp_move]
+
+
+                    print(f"DEBUG: Testing incoming damage with moves: {test_moves}")
+
+
+                    for om in test_moves:
+
+
+                        d = estimate_damage(tmp_state, opp_key, cand_key, str(om), mi)
+
+
+                        rr = d.get('rolls', []) or []
+
+
+                        if rr:
+
+
+                            avg_dmg = sum(rr)/len(rr)
+
+
+                            print(f"DEBUG: Move {om} would deal {avg_dmg:.1f} to {species}")
+
+
+                            worst = max(worst, avg_dmg)
+
+
+                    incoming = worst / cand_max
+
+
+                    print(f"DEBUG: Worst incoming for {species}: {worst:.1f}/{cand_max:.1f} = {incoming:.3f}")
+
+
+                except Exception as e:
+
+
+                    print(f"DEBUG: Error calculating incoming for {species}: {e}")
+
+
+                    pass
+
+
+
+
+
+                # Typing bonus: reward resist/immunity to revealed move types
+
+
+                immune = 0
+
+
+                resist = 0
+
+
+                try:
+
+
+                    print(f"DEBUG: Checking type resistances for {species} with types {cand_ps.types}")
+
+
+                    print(f"DEBUG: Known opponent moves: {opp_moves_known}")
+
+
+
+
+                    # Check against known opponent moves
+
+
+                    for om in opp_moves_known:
+
+
+                        # we need the move type; pull from moves DB
+
+
+                        raw = mi.raw(om)
+
+
+                        if raw:
+
+
+                            t = raw.get("type")
+
+
+                            mult = _type_mult(t, cand_ps.types, chart)
+
+
+                            print(f"DEBUG: Move {om} ({t}) vs {species} = {mult}x")
+
+
+                            if mult == 0.0:
+
+
+                                immune += 1
+
+
+                            elif mult <= 0.5:
+
+
+                                resist += 1
+
+
+                        else:
+
+
+                            print(f"DEBUG: No raw data for move {om}")
+
+
+
+
+
+                    # If no known moves, check against common move types for type bonus estimation
+
+
+                    if not opp_moves_known:
+
+
+                        print(f"DEBUG: No known opponent moves, checking against common move types")
+
+
+                        common_move_types = [
+
+
+                            'normal', 'fire', 'water', 'electric', 'grass', 'ice',
+
+
+                            'fighting', 'poison', 'ground', 'flying', 'psychic',
+
+
+                            'bug', 'rock', 'ghost', 'dragon', 'dark', 'steel', 'fairy'
+
+
+                        ]
+
+
+
+
+
+                        for move_type in common_move_types:
+
+
+                            mult = _type_mult(move_type, cand_ps.types, chart)
+
+
+                            if mult == 0.0:
+
+
+                                immune += 1
+
+
+                            elif mult <= 0.5:
+
+
+                                resist += 1
+
+
+
+
+                        print(f"DEBUG: Against all types - immune: {immune}, resist: {resist}")
+
+
+
+                        # Scale down since we're checking against all types
+
+
+                        # Give partial credit for type advantages
+
+
+                        type_bonus = (0.5 * immune + 0.3 * resist) * 0.1  # Scale factor for fallback
+
+
+                    else:
+
+
+                        # Use full bonus for known moves
+
+
+                        type_bonus = 0.5 * immune + 0.3 * resist
+
+
+                except Exception as e:
+
+
+                    print(f"DEBUG: Error calculating type bonus for {species}: {e}")
+
+
+                    pass
+
+
+                print(f"DEBUG: Type bonus for {species}: immune={immune}, resist={resist}, bonus={type_bonus:.3f}")
+
+
+
+
+
+                # Outgoing potential next turn from the candidate (if we know its moves)
+
+
+                out_frac = 0.0
+
+
+                try:
+
+
+                    best = 0.0
+
+
+                    opp_ps = tmp_state.team.opponent[opp_key]
+
+
+                    opp_max = float(opp_ps.max_hp or opp_ps.stats.raw.get("hp", 1) or 1)
+
+
+                    # First try to get moves from the team state
+
+
+                    cand_moves = cand_ps.moves or []
+
+
+                    print(f"DEBUG: {species} has {len(cand_moves)} moves from team state")
+
+
+
+
+
+                    # If no moves in team state, try to get them from the original poke-env object
+
+
+                    if not cand_moves:
+
+
+                        print(f"DEBUG: {species} trying to get moves from poke-env battle object")
+
+
+                        try:
+
+
+                            # Find the corresponding poke-env Pokemon object
+
+
+                            poke_env_pokemon = None
+
+
+                            for switch_option in legal_switches:
+
+
+                                if str(getattr(switch_option, 'species', '')).lower() == species.lower():
+
+
+                                    poke_env_pokemon = switch_option
+
+
+                                    break
+
+
+                            if poke_env_pokemon:
+
+
+                                # Try to get moves from the poke-env object
+
+
+                                penv_moves = getattr(poke_env_pokemon, 'moves', None) or []
+
+
+                                print(f"DEBUG: {species} found {len(penv_moves)} moves in poke-env object")
+
+
+
+
+
+                                # Convert poke-env moves to our format for damage calculation
+
+
+                                for penv_move in penv_moves:
+
+
+                                    mid = getattr(penv_move, 'id', None) or getattr(penv_move, 'move_id', None)
+
+
+                                    if mid:
+
+
+                                        print(f"DEBUG: {species} found move {mid} from poke-env object")
+
+
+                                        try:
+
+
+                                            d2 = estimate_damage(tmp_state, cand_key, opp_key, str(mid), mi)
+
+
+                                            print(f"DEBUG: {species} move {mid} damage result: {d2}")
+
+
+                                            rr2 = d2.get('rolls', []) or []
+
+
+                                            if rr2:
+
+
+                                                avg_out = sum(rr2)/len(rr2)
+
+
+                                                print(f"DEBUG: {species} move {mid} would deal {avg_out:.1f}")
+
+
+                                                best = max(best, avg_out)
+
+
+                                            else:
+
+
+                                                print(f"DEBUG: {species} move {mid} returned no damage rolls")
+
+
+                                        except Exception as move_err:
+
+
+                                            print(f"DEBUG: {species} error calculating damage for move {mid}: {move_err}")
+
+
+                            else:
+
+
+                                print(f"DEBUG: {species} no corresponding poke-env object found")
+
+
+                        except Exception as penv_err:
+
+
+                            print(f"DEBUG: {species} error accessing poke-env moves: {penv_err}")
+
+
+                    else:
+
+
+                        # Use team state moves (original logic)
+
+
+                        for i, mslot in enumerate(cand_moves):
+
+
+                            print(f"DEBUG: {species} move slot {i}: {mslot}")
+
+
+                            mid = getattr(mslot, "id", None)
+
+
+                            if not mid:
+
+
+                                print(f"DEBUG: {species} move slot {i} has no id, trying other attributes")
+
+
+                                # Try alternative attribute names
+
+
+                                for attr in ['move', 'name', 'move_id']:
+
+
+                                    alt_id = getattr(mslot, attr, None)
+
+
+                                    if alt_id:
+
+
+                                        mid = alt_id
+
+
+                                        print(f"DEBUG: {species} found move id '{mid}' via attribute '{attr}'")
+
+
+                                        break
+
+
+                            if not mid:
+
+
+                                print(f"DEBUG: {species} skipping move slot {i} - no valid id found")
+
+
+                                continue
+
+
+                            print(f"DEBUG: {species} calculating damage for move {mid}")
+
+
+                            try:
+
+
+                                d2 = estimate_damage(tmp_state, cand_key, opp_key, str(mid), mi)
+
+
+                                print(f"DEBUG: {species} move {mid} damage result: {d2}")
+
+
+                                rr2 = d2.get('rolls', []) or []
+
+
+                                if rr2:
+
+
+                                    avg_out = sum(rr2)/len(rr2)
+
+
+                                    print(f"DEBUG: {species} move {mid} would deal {avg_out:.1f}")
+
+
+                                    best = max(best, avg_out)
+
+
+                                else:
+
+
+                                    print(f"DEBUG: {species} move {mid} returned no damage rolls")
+
+
+                            except Exception as move_err:
+
+
+                                print(f"DEBUG: {species} error calculating damage for move {mid}: {move_err}")
+
+
+
+
+
+                    # If still no moves found, try some fallback strategies
+
+
+                    if best == 0.0:
+
+
+                        print(f"DEBUG: {species} no moves found via normal methods, trying fallbacks")
+
+
+                        # Try using a generic move based on the Pokemon's typing or common moves
+
+
+                        fallback_moves = []
+
+
+
+
+
+                        # Add type-based STAB moves
+
+
+                        pokemon_types = cand_ps.types or ()
+
+
+                        if 'fire' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['flamethrower', 'fireblast', 'overheat'])
+
+
+                        if 'water' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['surf', 'hydropump', 'watergun'])
+
+
+                        if 'electric' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['thunderbolt', 'thunder', 'discharge'])
+
+
+                        if 'grass' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['energyball', 'gigadrain', 'leafstorm'])
+
+
+                        if 'psychic' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['psychic', 'psyshock', 'futuresight'])
+
+
+                        if 'fighting' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['closecombat', 'superpower', 'focusblast'])
+
+
+                        if 'dragon' in str(pokemon_types).lower():
+
+
+                            fallback_moves.extend(['dragonpulse', 'dracometeor', 'outrage'])
+
+
+
+
+
+                        # Add common physical/special moves
+
+
+                        fallback_moves.extend(['return', 'bodyslam', 'doubleedge', 'facade'])
+
+
+
+
+
+                        for fallback_move in fallback_moves[:3]:  # Try top 3 fallbacks
+
+
+                            try:
+
+
+                                print(f"DEBUG: {species} trying fallback move {fallback_move}")
+
+
+                                d2 = estimate_damage(tmp_state, cand_key, opp_key, fallback_move, mi)
+
+
+                                rr2 = d2.get('rolls', []) or []
+
+
+                                if rr2:
+
+
+                                    avg_out = sum(rr2)/len(rr2)
+
+
+                                    print(f"DEBUG: {species} fallback move {fallback_move} would deal {avg_out:.1f}")
+
+
+                                    best = max(best, avg_out)
+
+
+                                    break  # Use first working fallback
+
+
+                            except Exception:
+
+
+                                continue
+
+
+
+
+
+                    if best > 0:
+
+
+                        out_frac = best / opp_max
+
+
+                        print(f"DEBUG: Best outgoing for {species}: {best:.1f}/{opp_max:.1f} = {out_frac:.3f}")
+
+
+                    else:
+
+
+                        print(f"DEBUG: No outgoing damage calculated for {species} - best damage was {best}")
+
+
+                except Exception as e:
+
+
+                    print(f"DEBUG: Error calculating outgoing for {species}: {e}")
+
+
+                    import traceback
+
+
+                    print(f"DEBUG: Full traceback: {traceback.format_exc()}")
+
+
+                    pass
+
+
+
+
+
+                hp_frac = float(getattr(p, 'current_hp_fraction', 1.0) or 1.0)
+
+
+                print(f"DEBUG: {species} HP fraction: {hp_frac:.3f}")
+
+
+
+
+
+                # Risk-aware switch score: prefer lower incoming + hazards, higher future output, and better typing
+
+
+                base_score = (out_frac * 1.2) - (incoming * 1.1) - (haz_frac * 0.5)
+
+
+                score = max(0.0, base_score) + type_bonus
+
+
+                print(f"DEBUG: {species} score calculation:")
+
+
+                print(f"  Base: ({out_frac:.3f} * 1.2) - ({incoming:.3f} * 1.1) - ({haz_frac:.3f} * 0.5) = {base_score:.3f}")
+
+
+                print(f"  Final: max(0.0, {base_score:.3f}) + {type_bonus:.3f} = {score:.3f}")
+
+
+                switches_eval.append({
+
+
+                    'species': species,
+
+
+                    'score': float(score),
+
+
+                    'hp_fraction': hp_frac,
+
+
+                    'incoming_on_switch': float(incoming),
+
+
+                    'hazards_frac': float(haz_frac),
+
+
+                    'type_bonus': float(type_bonus),
+
+
+                    'stay_incoming': float(stay_incoming),
+
+
+                    'outgoing_frac': float(out_frac),  # Add this for debugging
+
+
+                    'base_score': float(base_score),    # Add this for debugging
+
+
+                })
+
+
+
+
+
+            switches_eval.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+
+
+
+
+
+        # ---- Decide -----------------------------------------------------------
+
+
+        snap = snapshot_battle(battle)
+
+
+        best_move = moves_eval[0] if moves_eval else None
+
+
+        best_switch = switches_eval[0] if switches_eval else None
+
+
+
+
+
+        # If we are forced to switch, do it
+
+
+        if force_switch and best_switch:
+
+
+            return ChosenAction(kind='switch', switch_species=best_switch['species'],
+
+
+                                debug={'candidates': moves_eval, 'switches': switches_eval, 'snapshot': snap,
+
+
+                                       'picked': {'kind': 'switch', **best_switch}})
+
+
+
+
+
+        # Otherwise compare EVs
+
+
+        if best_move and (not best_switch or best_move['score'] >= best_switch['score']):
+
+
+            return ChosenAction(kind='move', move_id=str(best_move['id']),
+
+
+                                debug={'candidates': moves_eval, 'switches': switches_eval, 'snapshot': snap,
+
+
+                                       'picked': {'kind': 'move', **best_move}})
+
+
+        if best_switch:
+
+
+            return ChosenAction(kind='switch', switch_species=best_switch['species'],
+
+
+                                debug={'candidates': moves_eval, 'switches': switches_eval, 'snapshot': snap,
+
+
+                                       'picked': {'kind': 'switch', **best_switch}})
+
+
+
+
+
+        # Fallbacks
+
+
+        if legal_moves:
+
+
+            return ChosenAction(kind='move', move_id=str(getattr(legal_moves[0], 'id', '')),
+
+
+                                debug={'snapshot': snap, 'fallback': True})
+
+
+        if legal_switches:
+
+
+            # never pick active species
+
+
+            for p in legal_switches:
+
+
+                sp = str(getattr(p, 'species', '') or '')
+
+
+                if my_key:
+
+
+                    cursp = str(getattr(state.team.ours[my_key], 'species', '') or '')
+
+
+                else:
+
+
+                    cursp = ''
+
+
+                if sp.lower() != cursp.lower():
+
+
+                    return ChosenAction(kind='switch', switch_species=sp, debug={'snapshot': snap, 'fallback': True})
+
+
+            # if all else fails, pick first bench
+
+
+            return ChosenAction(kind='switch', switch_species=str(getattr(legal_switches[0], 'species', '')),
+
+
+                                debug={'snapshot': snap, 'fallback': True})
+
+
+        return ChosenAction(kind='move', move_id='struggle', debug={'snapshot': snap, 'fallback': True})
+
+
+
+
+
+# -------------- Poke-env Player wrapper -----------------------------------
+
+
+try:
+
+
+    from poke_env.player.player import Player  # type: ignore
+
+
+except Exception:
+
+
+    Player = object  # fallback for type checking
+
+
+
+
+
+class StockfishPokeEnvPlayer(Player):  # type: ignore[misc]
+
+
+    def __init__(self, *args, **kwargs):
+
+
+        # Hook for UI
+
+
+        self.on_think_hook = kwargs.pop('on_think', None)
+
+
+        engine_depth = kwargs.pop('engine_depth', None)
+
+
+        self.engine = kwargs.pop('engine', None) or StockfishModel(kwargs.get('battle_format', 'gen9ou'))
+
+
+        try:
+
+
+            self.engine.set_depth(int(engine_depth))
+
+
+        except Exception:
+
+
+            pass
+
+
+        super().__init__(*args, **kwargs)
+
+
+        # Convenience alias for older UI code
+
+
+        try:
+
+
+            self._psclient = self.ps_client
+
+
+        except Exception:
+
+
+            pass
+
+
+
+
+
+    # --------------- Buttons ---------------
+
+
+    async def forfeit_all(self):
+
+
+        # Forfeit all ongoing battles using the official client API.
+
+
+        try:
+
+
+            battles = dict(getattr(self, 'battles', {}) or {})
+
+
+            client = getattr(self, 'ps_client', None)
+
+
+            if not client:
+
+
+                return
+
+
+            for _id, b in battles.items():
+
+
+                try:
+
+
+                    tag = getattr(b, 'battle_tag', getattr(b, 'room_id', None)) or _id
+
+
+                    await client.send_message('/forfeit', room=str(tag))
+
+
+                except Exception:
+
+
+                    continue
+
+
+        except Exception:
+
+
+            pass
+
+
+
+
+
+    async def timer_all(self, on: bool):
+
+
+        try:
+
+
+            battles = dict(getattr(self, 'battles', {}) or {})
+
+
+            client = getattr(self, 'ps_client', None)
+
+
+            if not client:
+
+
+                return
+
+
+            msg = '/timer on' if on else '/timer off'
+
+
+            for _id, b in battles.items():
+
+
+                try:
+
+
+                    tag = getattr(b, 'battle_tag', getattr(b, 'room_id', None)) or _id
+
+
+                    await client.send_message(msg, room=str(tag))
+
+
+                except Exception:
+
+
+                    continue
+
+
+        except Exception:
+
+
+            pass
+
+
+
+
+
+    # --------------- Core decision ---------------
+
+
+    def choose_move(self, battle):
+
+
+        decision = self.engine.choose_action(battle)
+
+
+        try:
+
+
+            if self.on_think_hook and isinstance(decision.debug, dict):
+
+
+                # provide the snapshot and current battle object
+
+
+                dd = dict(decision.debug)
+
+
+                dd.setdefault('snapshot', snapshot_battle(battle))
+
+
+                try:
+
+
+                    import json, logging
+
+
+                    logging.getLogger('Think').info(
+
+
+                        'UI_THINK turn=%s payload=%s',
+
+
+                        getattr(battle, 'turn', None),
+
+
+                        json.dumps(dd, default=str)
+
+
+                    )
+
+
+                except Exception:
+
+
+                    pass
+
+
+                self.on_think_hook(battle, dd)
+
+
+        except Exception:
+
+
+            pass
+
+
+
+
+
+        # Convert ChosenAction to poke-env order
+
+
+        try:
+
+
+            if decision.kind == 'move' and decision.move_id:
+
+
+                for m in (getattr(battle, 'available_moves', []) or []):
+
+
+                    if str(getattr(m, 'id', '')) == str(decision.move_id):
+
+
+                        return self.create_order(m)
+
+
+                # fallback: first legal move
+
+
+                return self.create_order((getattr(battle, 'available_moves', []) or [None])[0]) or self.choose_random_move(battle)
+
+
+            elif decision.kind == 'switch' and decision.switch_species:
+
+
+                # never select active mon
+
+
+                try:
+
+
+                    cur = getattr(battle, "active_pokemon", None)
+
+
+                    cursp = (getattr(cur, "species", None) or "").lower()
+
+
+                except Exception:
+
+
+                    cursp = ""
+
+
+                for p in (getattr(battle, 'available_switches', []) or []):
+
+
+                    sp = (str(getattr(p, 'species', '')).lower())
+
+
+                    if sp == cursp:
+
+
+                        continue
+
+
+                    if sp == str(decision.switch_species).lower():
+
+
+                        return self.create_order(p)
+
+
+                # if not found by species, pick first bench (guard)
+
+
+                for p in (getattr(battle, 'available_switches', []) or []):
+
+
+                    if (str(getattr(p, 'species', '')).lower()) != cursp:
+
+
+                        return self.create_order(p)
+
+
+                return self.choose_random_move(battle)
+
+
+            return self.choose_random_move(battle)
+
+
+        except Exception:
+
+
+            return self.choose_random_move(battle)

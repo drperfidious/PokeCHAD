@@ -1,0 +1,7 @@
+{
+  "go_first_bonus": 0.15,
+  "opp_dmg_penalty": 0.5,
+  "survival_bonus": 0.6,
+  "switch_resist_bonus": 1.0,
+  "switch_hazard_penalty": 0.8
+}
