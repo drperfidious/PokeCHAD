@@ -60,8 +60,6 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 # Added by patch_think_showdown.py
 import os
-from Data.think_helpers import normalize_accuracy
-
 try:
     from tools.Data.showdown.ps_data_loader import load_showdown_dir  # noqa: F401
 except Exception:
@@ -157,7 +155,7 @@ class MovesInfo:
             type=m.get("type"),
             category=m.get("category"),
             base_power=m.get("basePower") if "basePower" in m else m.get("base_power"),
-            accuracy=normalize_accuracy(m.get('accuracy')),
+            accuracy=m.get("accuracy"),
             priority=m.get("priority", 0),
             target=m.get("target"),
             pp=m.get("pp"),
