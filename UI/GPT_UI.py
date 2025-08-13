@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 
 class GPT_UI:
     """User interface for GPT model interactions"""
-
+    
     def __init__(self, root):
         self.root = root
         pass

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import os
 
 from .team_state import TeamState, PokemonState
 from .poke_env_battle_environment import to_field_state, FieldState as EnvFieldState
@@ -52,6 +53,14 @@ from .battle_helper import (
     stab_multiplier,
 )
 
+# New: common boosting item lookup
+_BOOST_ITEMS_TYPE = {
+    # plates & drives & standard type boosters (approx 1.2)
+    'charcoal': (1.2, 'fire'), 'mysticwater': (1.2, 'water'), 'magnet': (1.2, 'electric'), 'miracleseed': (1.2, 'grass'),
+    'nevermeltice': (1.2, 'ice'), 'blackbelt': (1.2, 'fighting'), 'poisonbarb': (1.2, 'poison'), 'softsand': (1.2, 'ground'),
+    'sharpbeak': (1.2, 'flying'), 'twistedspoon': (1.2, 'psychic'), 'silkscarf': (1.2, 'normal'), 'spelltag': (1.2, 'ghost'),
+    'dragonfang': (1.2, 'dragon'), 'blackglasses': (1.2, 'dark'), 'metalcoat': (1.2, 'steel'), 'pixieplate': (1.2, 'fairy'),
+}
 # --------------------------------- State -----------------------------------------
 
 @dataclass
@@ -94,6 +103,10 @@ class MoveChoice:
     priority: int
     type: Optional[str]
     category: Optional[str]
+    # Extended metadata for UI / heuristics
+    pp: Optional[int] = None
+    max_pp: Optional[int] = None
+    disabled: bool = False
 
 def enumerate_actions(battle) -> Dict[str, List[Any]]:
     moves = []
@@ -105,6 +118,9 @@ def enumerate_actions(battle) -> Dict[str, List[Any]]:
             priority=int(getattr(m, "priority", 0) or 0),
             type=getattr(m, "type", None),
             category=getattr(m, "category", None),
+            pp=getattr(m, "pp", None),
+            max_pp=getattr(m, "max_pp", None) or getattr(m, "maxpp", None),
+            disabled=bool(getattr(m, "disabled", False)),
         ))
     switches = [getattr(p, "species", None) for p in (getattr(battle, "available_switches", None) or [])]
     return {"moves": moves, "switches": switches}
@@ -337,35 +353,114 @@ def estimate_damage(
         is_biting=bool(raw.flags.get("bite", False)),
         multihit=(raw.multihit if isinstance(raw.multihit, list) else None),
     )
+    # Adjust contact if Punching Glove (boost applied later) removes contact
+    if (atk.item or '').lower() == 'punchingglove' and mv.is_punch:
+        mv.makes_contact = False  # negate contact interactions
 
     # Type chart and helpers
     chart_fn = mi.get_type_chart
     dmg_field = _dm_field_from_env_field(state.field)
 
-    # Extra modifiers (Life Orb, Expert Belt, etc.) -> placeholder (you can extend here)
-    extra = []
+    # Extra modifiers (Life Orb, Expert Belt, Muscle Band, Wise Glasses, type boosters, Technician, Sheer Force)
+    extra: List[float] = []
     it = (atk.item or "").lower() if atk.item else ""
+    ability = (atk.ability or '').lower()
+    mv_type = (mv.type or '').lower()
+    category = (mv.category or '').lower()
+    base_power = mv.base_power or 0
+
+    # Life Orb
     if it == "lifeorb":
         extra.append(1.3)
+    # Expert Belt (only if SE hit -> we append later conditionally)
+    expert_belt = it == 'expertbelt'
+    # Muscle Band / Wise Glasses
+    if it == 'muscleband' and category == 'physical':
+        extra.append(1.1)
+    if it == 'wiseglasses' and category == 'special':
+        extra.append(1.1)
+    # Type boosting items
+    if it in _BOOST_ITEMS_TYPE:
+        mult, t = _BOOST_ITEMS_TYPE[it]
+        if t == mv_type:
+            extra.append(mult)
+    # Technician
+    if ability == 'technician' and base_power and base_power <= 60:
+        extra.append(1.5)
+    # Sheer Force (approx power mod 1.3 if move has a secondary effect)
+    if ability == 'sheerforce':
+        try:
+            if raw.raw.get('secondary') or raw.raw.get('secondaries'):
+                extra.append(1.3)
+        except Exception:
+            pass
+    # Tough Claws (contact physical damaging moves)
+    if ability == 'toughclaws' and mv.makes_contact and category in {'physical'}:
+        extra.append(1.3)
+    # Iron Fist (punching moves)
+    if ability == 'ironfist' and mv.is_punch:
+        extra.append(1.2)
+    # Strong Jaw (biting moves)
+    if ability == 'strongjaw' and mv.is_biting:
+        extra.append(1.5)
+    # Sharpness (slicing flag in move data)
+    try:
+        if ability == 'sharpness' and raw.flags.get('slicing', False):
+            extra.append(1.5)
+    except Exception:
+        pass
+    # Punk Rock (sound moves offensive boost)
+    if ability == 'punkrock' and mv.is_sound and category in {'physical','special'}:
+        extra.append(1.3)
+    # Reckless (recoil moves power boost)
+    try:
+        if ability == 'reckless' and (raw.raw.get('recoil') or raw.raw.get('hasCrashDamage')):
+            extra.append(1.2)
+    except Exception:
+        pass
+    # Punching Glove boost (already removed contact, boosts punch moves)
+    if it == 'punchingglove' and mv.is_punch:
+        extra.append(1.1)
+    # Guts handled in passive multipliers, Adaptability in STAB, Hustle in passive.
+
+    # Wrap type effectiveness for Tinted Lens & Expert Belt conditional application
+    def _type_eff(move_type: str, defender_types, type_chart, move_id=None):
+        eff = type_effectiveness(move_type, defender_types, type_chart, move_id=move_id)
+        if ability == 'tintedlens' and eff < 1.0:
+            eff *= 2.0
+        # Expert Belt conditional (only if SE >1 after tint lens)
+        if expert_belt and eff > 1.0:
+            eff *= 1.2
+        return eff
 
     res = calc_damage_range(
         c_atk, c_dfd, mv, dmg_field,
         get_type_chart=chart_fn,
         is_critical=is_critical,
         extra_modifiers=extra,
-        type_effectiveness_fn=type_effectiveness,
+        type_effectiveness_fn=_type_eff,
         stab_fn=stab_multiplier,
         weather_fn=weather_modifier,
         terrain_fn=terrain_modifier,
         screen_fn=screen_modifier,
     )
-    return {
+    out = {
         "min": res.min_damage,
         "max": res.max_damage,
         "rolls": res.rolls,
         "effectiveness": res.effectiveness,
         "mods": res.applied_modifiers,
     }
+    if os.getenv('POKECHAD_DEBUG_TYPES'):
+        out.update({
+            'attacker_species': atk.species,
+            'attacker_types': c_atk.types,
+            'defender_species': dfd.species,
+            'defender_types': c_dfd.types,
+            'move_type': mv.type,
+            'move_id': mv.move_id,
+        })
+    return out
 
 # ------------------------- Switch-in effects -------------------------------------
 
@@ -489,4 +584,66 @@ def would_fail(
     if (user.ability or "").lower() == "prankster" and cat == "status" and ("dark" in {t for t in target.types if t}):
         return True, "prankster-vs-dark"
 
+    # Heal Bell / Aromatherapy futility (Showdown: fails if no party member would be cured)
+    try:
+        if raw.id in {"healbell","aromatherapy"}:
+            side_dict = state.team.ours if user_key in state.team.ours else state.team.opponent
+            has_curable = False
+            for pk in side_dict.values():
+                st = (pk.status or '').lower()
+                if st and st not in {"fnt", "", "none"}:
+                    has_curable = True; break
+            if not has_curable:
+                return True, "no-status-to-heal"
+    except Exception:
+        pass
+    # Recovery at full HP (simple heuristic) – treat purely healing moves as futile
+    try:
+        if (raw.raw.get('heal') or raw.id in {"recover","softboiled","roost","morningsun","synthesis","slackoff","milkdrink","shoreup","strengthsap"}) and (user.current_hp is not None) and (user.max_hp is not None) and user.current_hp >= user.max_hp:
+            return True, "full-hp"
+    except Exception:
+        pass
+    # Thunder Wave basic immunities / redundancy
+    try:
+        if raw.id == "thunderwave":
+            tgt_status = (target.status or '').lower()
+            if tgt_status and tgt_status not in {"fnt","","none"}:
+                return True, "target-already-statused"
+            tgt_types = {t for t in target.types if t}
+            if 'electric' in tgt_types or 'ground' in tgt_types:
+                return True, "immune-thunder-wave"
+            # Safeguard check
+            side_has_safeguard = (state.opp_side.get('safeguard') if user_key in state.team.ours else state.my_side.get('safeguard'))
+            if side_has_safeguard:
+                return True, "blocked-by-safeguard"
+    except Exception:
+        pass
+    # Will-O-Wisp immunities / redundancy
+    try:
+        if raw.id == "willowisp":
+            tgt_status = (target.status or '').lower()
+            if tgt_status and tgt_status not in {"fnt","","none"}:
+                return True, "target-already-statused"
+            tgt_types = {t for t in target.types if t}
+            if 'fire' in tgt_types:
+                return True, "immune-wisp"
+            side_has_safeguard = (state.opp_side.get('safeguard') if user_key in state.team.ours else state.my_side.get('safeguard'))
+            if side_has_safeguard:
+                return True, "blocked-by-safeguard"
+    except Exception:
+        pass
+    # Toxic immunities / redundancy (ignore Toxic Spikes etc.)
+    try:
+        if raw.id == "toxic" or raw.id == "poisonpowder":
+            tgt_status = (target.status or '').lower()
+            if tgt_status and tgt_status not in {"fnt","","none"}:
+                return True, "target-already-statused"
+            tgt_types = {t for t in target.types if t}
+            if 'steel' in tgt_types or 'poison' in tgt_types:
+                return True, "immune-toxic"
+            side_has_safeguard = (state.opp_side.get('safeguard') if user_key in state.team.ours else state.my_side.get('safeguard'))
+            if side_has_safeguard:
+                return True, "blocked-by-safeguard"
+    except Exception:
+        pass
     return False, "ok"

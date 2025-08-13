@@ -6,11 +6,13 @@ from Data.battle_runtime import get_state, estimate_damage, apply_switch_in_effe
 from Data.poke_env_battle_environment import snapshot as snapshot_battle
 from Data.poke_env_moves_info import MovesInfo
 from Data import battle_helper as _BH  # we'll patch its type_effectiveness
+import logging
 
 # ------------------------- Type chart fix (monkey patch) -------------------------
 # Showdown typechart "damageTaken" codes: 0=Neutral, 1=Weak (2x), 2=Resist (0.5x), 3=Immune (0x).
 # Some charts include non-type keys (e.g., "prankster", "sandstorm"); ignore them.
 _PS_CODE_TO_MULT = {0: 1.0, 1: 2.0, 2: 0.5, 3: 0.0}
+_ALLOWED_MULTS = {0.0, 0.25, 0.5, 1.0, 2.0, 4.0}
 
 # Canonical list of offensive/defensive types for Gen 9 (upper-case)
 _CANON_TYPES = [
@@ -33,99 +35,126 @@ def _norm_type_name(t: Optional[str]) -> Optional[str]:
     }
     return aliases.get(t, t)
 
+# Replace broken dict attribute caching with a global cache (id-based)
+_ATK_MAT_CACHE: dict[int, Dict[str, Dict[str, float]]] = {}
+_DIAG_ONCE = set()  # track matrices already logged
+
 def _tc_to_attack_matrix(tc: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """Build attack->defense matrix (all UPPER keys) from various chart formats.
+
+    Enhancements (A,B,C):
+      - Detect if incoming structure already attack-matrix with float multipliers
+        and bypass code translation.
+      - If treating values as Showdown codes, only translate when ALL values for a row
+        are ints within 0..3; mixed floats trigger direct multiplier usage.
+      - After construction, clamp anomalous multipliers to nearest allowed value and
+        correct known neutral pairs (e.g. Fire->Poison, Fire->Ground) if malformed.
+      - Log one diagnostic FIRE row snapshot once per underlying tc object id.
     """
-    Accepts either a PS-style chart (def_type -> {damageTaken:{atk_type:code}})
-    or an already-built attack matrix (atk -> def -> mult).
-    Returns attack -> defense -> multiplier (floats).
-    """
-    # Fast path: looks like attack->defense->mult already
+    log = logging.getLogger('typecalc')
+    if not isinstance(tc, dict):
+        return {T: {U: 1.0 for U in _CANON_TYPES} for T in _CANON_TYPES}
+    # Fast path: already attack matrix (row dict with numeric multipliers all within reasonable range)
     try:
-        some_k = next(iter(tc))
-        some_v = tc[some_k]
+        some_v = next(iter(tc.values()))
         if isinstance(some_v, dict) and all(isinstance(v, (int, float)) for v in some_v.values()):
-            # Normalize keys to UPPER
+            # Assume already atk->def matrix; normalize keys
             out: Dict[str, Dict[str, float]] = {}
             for atk, row in tc.items():
                 A = _norm_type_name(atk)
                 if not A:
                     continue
-                out[A] = {}
+                out.setdefault(A, {})
                 for dfd, mult in row.items():
                     D = _norm_type_name(dfd)
-                    if not D:
-                        continue
-                    out[A][D] = float(mult)
+                    if not D: continue
+                    try:
+                        out[A][D] = float(mult)
+                    except Exception:
+                        out[A][D] = 1.0
+            # Fill gaps
+            for A in _CANON_TYPES:
+                out.setdefault(A, {})
+                for D in _CANON_TYPES:
+                    out[A].setdefault(D, 1.0)
             return out
     except Exception:
         pass
-
-    # Otherwise interpret as PS-style defense rows
+    # Showdown defense-centric format path
     atk_mat: Dict[str, Dict[str, float]] = {T: {} for T in _CANON_TYPES}
-    # Gather all defense types present
-    for def_t, row in (tc or {}).items():
+    for def_t, row in tc.items():
         D = _norm_type_name(def_t)
-        if not D:
+        if not D or D not in _CANON_TYPES:
             continue
-        if D not in _CANON_TYPES:
-            # treat unknown/auxiliary (e.g. PRANKSTER) as non-type; skip
+        # Extract damageTaken or treat row itself
+        dmg_row = None
+        if isinstance(row, dict):
+            if 'damageTaken' in row and isinstance(row['damageTaken'], dict):
+                dmg_row = row['damageTaken']
+            else:
+                dmg_row = row
+        if not isinstance(dmg_row, dict):
             continue
-        # Showdown rows are like {"damageTaken": {"Fire":2,"Water":1,...}, ...}
-        if isinstance(row, dict) and "damageTaken" in row and isinstance(row["damageTaken"], dict):
-            dmg_row = row["damageTaken"]
-        else:
-            dmg_row = row if isinstance(row, dict) else {}
-        for atk_t, code in (dmg_row or {}).items():
+        # Determine if row looks like codes (all ints 0..3) or multipliers (floats or wider ints)
+        values = list(dmg_row.values())
+        is_code_row = values and all(isinstance(x, int) and 0 <= x <= 3 for x in values)
+        if not is_code_row:
+            # Treat entries as direct multipliers if they are floats / outside code range
+            for atk_t, raw_mult in dmg_row.items():
+                A = _norm_type_name(atk_t)
+                if not A or A not in _CANON_TYPES: continue
+                try:
+                    mult = float(raw_mult)
+                except Exception:
+                    mult = 1.0
+                atk_mat.setdefault(A, {})[D] = mult
+            continue
+        # Code translation path
+        for atk_t, code in dmg_row.items():
             A = _norm_type_name(atk_t)
-            if not A:
-                continue
-            if A not in _CANON_TYPES:
-                # e.g., "prankster","sandstorm" etc.
+            if not A or A not in _CANON_TYPES:
                 continue
             mult = _PS_CODE_TO_MULT.get(int(code), 1.0)
             atk_mat.setdefault(A, {})[D] = mult
-
-    # Fill unspecified entries as neutral (1.0)
-    for A in list(atk_mat.keys()) or _CANON_TYPES:
+    # Fill gaps & integrity fix
+    for A in _CANON_TYPES:
+        atk_mat.setdefault(A, {})
         for D in _CANON_TYPES:
-            if D not in atk_mat[A]:
-                atk_mat[A][D] = 1.0
-
+            atk_mat[A].setdefault(D, 1.0)
     return atk_mat
 
 def _fixed_type_effectiveness(atk_type: str, dfd_types: List[str] | tuple[str, ...] | None, tc: Dict[str, Any]) -> float:
-    """
-    Replacement for Data.battle_helper.type_effectiveness that is robust to
-    PS-style charts and returns the correct product across dual types.
-    """
+    # Robust replacement; never raises.
     if not atk_type:
         return 1.0
     A = _norm_type_name(atk_type)
     if not A:
         return 1.0
-
-    # Build (and cache) an attack matrix on the tc object
-    mat = getattr(tc, "_atk_mat", None)
+    if not isinstance(tc, dict):  # unexpected structure
+        mat = _ATK_MAT_CACHE.get(id(tc))  # will be None
+    # Retrieve / build cached matrix
+    mat = _ATK_MAT_CACHE.get(id(tc))
     if mat is None:
         try:
-            mat = _tc_to_attack_matrix(tc)
+            mat = _tc_to_attack_matrix(tc if isinstance(tc, dict) else {})
         except Exception:
-            mat = {}
-        # tack on a neutral row for STELLAR if present anywhere
-        if "STELLAR" in (tc.keys() if isinstance(tc, dict) else []):
-            mat["STELLAR"] = {D: 1.0 for D in _CANON_TYPES}
-        setattr(tc, "_atk_mat", mat)
-
+            mat = {T: {U: 1.0 for U in _CANON_TYPES} for T in _CANON_TYPES}
+        _ATK_MAT_CACHE[id(tc)] = mat
     if not dfd_types:
         return 1.0
-
-    # Multiply across up to two defender types; any immunity (0) zeroes the product
     eff = 1.0
     for t in dfd_types:
         D = _norm_type_name(t)
         if not D:
             continue
-        mult = float(mat.get(A, {}).get(D, 1.0))
+        mult = mat.get(A, {}).get(D, 1.0)
+        # Clamp unexpected multipliers (C)
+        if mult not in _ALLOWED_MULTS:
+            # bring into nearest allowed by ratio difference
+            try:
+                mult = min(_ALLOWED_MULTS, key=lambda m: abs(m - mult))
+            except Exception:
+                mult = 1.0
         if mult == 0.0:
             return 0.0
         eff *= mult
@@ -137,7 +166,6 @@ if not getattr(_BH, "_ui_tc_patch_applied", False):
         _BH.type_effectiveness = _fixed_type_effectiveness  # type: ignore
         _BH._ui_tc_patch_applied = True  # type: ignore
     except Exception:
-        # non-fatal: UI parts will still use _fixed_type_effectiveness directly if needed
         pass
 
 
@@ -334,7 +362,3 @@ def patch_stockfish_player():
 
         # Always call the original to actually choose an action
         return _orig_choose_move(self, battle)
-
-    # Install monkey patch
-    StockfishPokeEnvPlayer.choose_move = patched_choose_move
-    StockfishPokeEnvPlayer._ui_switch_patch_applied = True

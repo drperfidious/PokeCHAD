@@ -1,4 +1,3 @@
-
 # stat_effects.py
 """
 Stat change + passive multipliers engine (abilities & items), designed to
@@ -28,6 +27,7 @@ from typing import Dict, Any, Optional, Tuple, List
 
 # Light dependency on team_state for the dataclass
 from .team_state import PokemonState, STATS
+from . import dex_registry
 
 def _to_id(s: str) -> str:
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
@@ -219,20 +219,13 @@ def on_switch_in(user: PokemonState, opponents: List[PokemonState]) -> None:
 def compute_passive_multipliers(state: PokemonState, field: Dict[str, Any]) -> Dict[str, float]:
     """Return per-stat multiplicative modifiers from abilities/items that are NOT stage-based.
 
-    Examples:
-        - Huge Power/Pure Power: ×2 Attack
-        - Gorilla Tactics: ×1.5 Attack (with move-lock; we only return the multiplier)
-        - Hustle: ×1.5 Attack (accuracy penalty is handled elsewhere)
-        - Guts: ignore burn Attack halving (handled in damage code), and ×1.5 Attack when statused
-        - Marvel Scale: ×1.5 Defense when statused
-        - Fluffy/Ice Scales: category-based damage halving are better treated in damage layer
-        - Orichalcum Pulse: Attack ×1.33 in sun (we include as 1.33 here; also sets Sun elsewhere)
-        - Supreme Overlord: damage mod; handle in damage layer
+    Extended to include Solar Power, Flower Gift, Protosynthesis/Quark Drive (non-speed stats),
+    and optional registry-driven custom boost keys: boostAtk/Def/SpA/SpD/Spe.
     """
     abil = _to_id(state.ability or "")
-    item = _to_id(state.item or "")
     status = (state.status or "").lower()
     weather = (field.get("weather") or "").lower()
+    terrain = (field.get("terrain") or "").lower()
 
     mults = {"atk": 1.0, "def": 1.0, "spa": 1.0, "spd": 1.0, "spe": 1.0}
 
@@ -248,10 +241,38 @@ def compute_passive_multipliers(state: PokemonState, field: Dict[str, Any]) -> D
         mults["def"] *= 1.5
     if abil == "orichalcumpulse" and weather == "sun":
         mults["atk"] *= 4/3
-
-    # Items already handled elsewhere for stats: Choice Band/Specs/Scarf, Assault Vest, Eviolite, etc.
-    # We don't multiply here to avoid double-counting. Keep this for ability-only multipliers.
-
+    if abil == "solarpower" and weather == "sun":
+        mults["spa"] *= 1.5
+    if abil == "flowergift" and weather == "sun":
+        mults["atk"] *= 1.5
+        mults["spd"] *= 1.5
+    # Protosynthesis / Quark Drive non-speed stat boost (speed handled elsewhere)
+    if abil in {"protosynthesis","quarkdrive"}:
+        active = False
+        if abil == "protosynthesis" and weather == "sun":
+            active = True
+        if abil == "quarkdrive" and terrain == "electric":
+            active = True
+        if active:
+            base_raw = state.stats.raw if state.stats else {}
+            subset = { 'atk': base_raw.get('atk',0), 'def': base_raw.get('def',0), 'spa': base_raw.get('spa',0), 'spd': base_raw.get('spd',0) }
+            if subset:
+                hi = max(subset.items(), key=lambda kv: kv[1])[0]
+                mults[hi] *= 1.3
+    # Registry-driven generic ability boosts
+    try:
+        adata = dex_registry.get_ability(abil)
+        if isinstance(adata, dict):
+            for k, v in adata.items():
+                if not isinstance(v, (int,float)): continue
+                lk = k.lower()
+                if lk == 'boostatk': mults['atk'] *= v
+                elif lk == 'boostdef': mults['def'] *= v
+                elif lk == 'boostspa': mults['spa'] *= v
+                elif lk == 'boostspd': mults['spd'] *= v
+                elif lk == 'boostspe': mults['spe'] *= v
+    except Exception:
+        pass
     return mults
 
 # ------------------------- Groundedness ------------------------------------------

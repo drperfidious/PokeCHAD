@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +9,7 @@ import subprocess
 import sys
 import threading
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -65,18 +65,21 @@ def pretty_boosts(boosts: Dict[str, int] | None) -> str:
 
 # --------------------------------- Window ---------------------------------
 class StockfishWindow(tk.Toplevel):
+    CONFIG_PATH = Path.home() / '.pokechad_ui_settings.json'
     def __init__(self, parent: tk.Tk, username: str, password: Optional[str], server_mode: str,
                  custom_ws: Optional[str], battle_format: str):
         super().__init__(parent)
         self.title("PokeCHAD — Stockfish Model")
         self.geometry("1180x740")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Load persisted prefs early
+        self._prefs = self._load_prefs()
 
         self.username = username
         self.password = password
         self.server_mode = server_mode
         self.custom_ws = custom_ws
-        self.battle_format = battle_format
+        self.battle_format = battle_format or self._prefs.get('stockfish_ui', {}).get('format') or battle_format
 
         # Telemetry file
         os.makedirs("logs", exist_ok=True)
@@ -102,8 +105,11 @@ class StockfishWindow(tk.Toplevel):
         self._last_fallback_turn: Optional[int] = None
         self._last_real_think_turn: Optional[int] = None
         self._root_log_handler_attached = False
+        self._finished_battles: set[str] = set()
+        self._active_battle_id: Optional[str] = None
 
         self._build_ui()
+        self._apply_loaded_prefs()  # set widget values from prefs after UI built
         self._pump_logs()
 
         # Bootstrap: connect immediately
@@ -128,6 +134,61 @@ class StockfishWindow(tk.Toplevel):
         return self.after(delay_ms, fn)
 
     # ---------- UI construction ----------
+    def _load_prefs(self) -> dict:
+        try:
+            if self.CONFIG_PATH.exists():
+                with open(self.CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_prefs(self):
+        try:
+            base = {}
+            if self.CONFIG_PATH.exists():
+                try:
+                    with open(self.CONFIG_PATH, 'r', encoding='utf-8') as f:
+                        base = json.load(f) or {}
+                        if not isinstance(base, dict):
+                            base = {}
+                except Exception:
+                    base = {}
+            ui = base.get('stockfish_ui', {}) if isinstance(base.get('stockfish_ui'), dict) else {}
+            ui.update({
+                'depth': int(self.depth_var.get()) if hasattr(self, 'depth_var') else None,
+                'branching': int(self.branch_var.get()) if hasattr(self, 'branch_var') else None,
+                'softmin_temp': float(self.softmin_temp_var.get()) if hasattr(self, 'softmin_temp_var') else None,
+                'verbose': bool(self.verbose_var.get()) if hasattr(self, 'verbose_var') else None,
+                'tree_trace': bool(self.tree_trace_var.get()) if hasattr(self, 'tree_trace_var') else None,
+                'format': self.format_var.get().strip() if hasattr(self, 'format_var') else None,
+            })
+            base['stockfish_ui'] = ui
+            with open(self.CONFIG_PATH, 'w', encoding='utf-8') as f:
+                json.dump(base, f, indent=2)
+        except Exception:
+            pass
+
+    def _apply_loaded_prefs(self):
+        ui = self._prefs.get('stockfish_ui', {}) if isinstance(self._prefs.get('stockfish_ui'), dict) else {}
+        try:
+            if ui.get('format') and hasattr(self, 'format_var'):
+                self.format_var.set(ui.get('format'))
+            if ui.get('depth') and hasattr(self, 'depth_var'):
+                self.depth_var.set(int(ui.get('depth')))
+            if ui.get('branching') and hasattr(self, 'branch_var'):
+                self.branch_var.set(int(ui.get('branching')))
+            if ui.get('softmin_temp') is not None and hasattr(self, 'softmin_temp_var'):
+                self.softmin_temp_var.set(float(ui.get('softmin_temp')))
+            if ui.get('verbose') is not None and hasattr(self, 'verbose_var'):
+                self.verbose_var.set(bool(ui.get('verbose')))
+            if ui.get('tree_trace') is not None and hasattr(self, 'tree_trace_var'):
+                self.tree_trace_var.set(bool(ui.get('tree_trace')))
+        except Exception:
+            pass
+
     def _build_ui(self):
         nb = ttk.Notebook(self); nb.pack(fill=tk.BOTH, expand=True)
 
@@ -141,9 +202,28 @@ class StockfishWindow(tk.Toplevel):
         self.format_combo.pack(side=tk.LEFT, padx=4)
 
         ttk.Label(controls, text="Depth:").pack(side=tk.LEFT, padx=(14, 2))
-        self.depth_var = tk.IntVar(value=1)
-        self.depth_spin = ttk.Spinbox(controls, from_=1, to=3, textvariable=self.depth_var, width=4, command=self._on_depth_changed)
+        self.depth_var = tk.IntVar(value=self._prefs.get('stockfish_ui', {}).get('depth', 1))
+        self.depth_spin = ttk.Spinbox(controls, from_=1, to=10, textvariable=self.depth_var, width=4, command=self._on_depth_changed)
         self.depth_spin.pack(side=tk.LEFT, padx=4)
+        # Branching width spinner (top-K moves considered in depth projection)
+        ttk.Label(controls, text="Branch:").pack(side=tk.LEFT, padx=(14, 2))
+        self.branch_var = tk.IntVar(value=self._prefs.get('stockfish_ui', {}).get('branching', 3))
+        self.branch_spin = ttk.Spinbox(controls, from_=1, to=10, textvariable=self.branch_var, width=4, command=self._on_branch_changed)
+        self.branch_spin.pack(side=tk.LEFT, padx=4)
+        # Softmin temperature spinner
+        ttk.Label(controls, text="Softmin T:").pack(side=tk.LEFT, padx=(14,2))
+        self.softmin_temp_var = tk.DoubleVar(value=self._prefs.get('stockfish_ui', {}).get('softmin_temp', 0.0))
+        self.softmin_spin = ttk.Spinbox(controls, from_=0.0, to=5.0, increment=0.1, textvariable=self.softmin_temp_var, width=5, command=self._on_softmin_changed)
+        self.softmin_spin.pack(side=tk.LEFT, padx=4)
+        self.softmin_spin.bind('<Return>', lambda e: self._on_softmin_changed())
+        # Verbose think checkbox
+        self.verbose_var = tk.BooleanVar(value=self._prefs.get('stockfish_ui', {}).get('verbose', bool(int(os.environ.get('POKECHAD_THINK_DEBUG','0')))))
+        self.verbose_chk = ttk.Checkbutton(controls, text="Verbose Think", variable=self.verbose_var, command=self._on_verbose_toggle)
+        self.verbose_chk.pack(side=tk.LEFT, padx=(14,4))
+        # Tree trace checkbox (detailed minimax branch logging)
+        self.tree_trace_var = tk.BooleanVar(value=self._prefs.get('stockfish_ui', {}).get('tree_trace', bool(int(os.environ.get('POKECHAD_TREE_TRACE','0')))))
+        self.tree_trace_chk = ttk.Checkbutton(controls, text="Tree Trace", variable=self.tree_trace_var, command=self._on_tree_trace_toggle)
+        self.tree_trace_chk.pack(side=tk.LEFT, padx=(4,4))
 
         ttk.Button(controls, text="Ladder 1", command=lambda: self._submit(self._ladder(1))).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="Challenge…", command=self._challenge_dialog).pack(side=tk.LEFT, padx=4)
@@ -152,6 +232,13 @@ class StockfishWindow(tk.Toplevel):
         ttk.Button(controls, text="Forfeit", command=lambda: self._submit(self._forfeit_all())).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="Train Weights", command=self._train_weights).pack(side=tk.LEFT, padx=4)
         ttk.Button(controls, text="Reload Weights", command=self._reload_weights).pack(side=tk.LEFT, padx=4)
+        ttk.Button(controls, text="Reset UI", command=self._reset_ui).pack(side=tk.LEFT, padx=(14,4))
+        # Battle selector (multi-game support)
+        ttk.Label(controls, text="Battle:").pack(side=tk.LEFT, padx=(14,2))
+        self.battle_choice_var = tk.StringVar(value="")
+        self.battle_combo = ttk.Combobox(controls, textvariable=self.battle_choice_var, values=[], width=24, state="readonly")
+        self.battle_combo.pack(side=tk.LEFT, padx=4)
+        self.battle_combo.bind('<<ComboboxSelected>>', lambda e: self._on_battle_select())
 
         # Team panes
         teams = ttk.Frame(dash); teams.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
@@ -171,20 +258,24 @@ class StockfishWindow(tk.Toplevel):
     def _make_team_tree(self, parent, title: str) -> ttk.Treeview:
         frame = ttk.LabelFrame(parent, text=title)
         frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        cols = ("slot", "species", "hp", "status", "boosts")
+        # Added 'active' column
+        cols = ("slot", "active", "species", "hp", "status", "boosts")
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=12)
-        for c, w in zip(cols, (60, 160, 60, 80, 220)):
-            tree.heading(c, text=c.upper())
+        headers = ("SLOT", "ACT", "SPECIES", "HP", "STATUS", "BOOSTS")
+        widths = (60, 40, 160, 60, 80, 220)
+        for c, h, w in zip(cols, headers, widths):
+            tree.heading(c, text=h)
             tree.column(c, width=w, anchor=tk.W)
         tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         return tree
 
     def _make_cand_tree(self, parent, title: str) -> ttk.Treeview:
         frame = ttk.LabelFrame(parent, text=title); frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        cols = ("move", "score", "exp_dmg", "acc", "eff", "first", "opp", "note")
+        # Added depth-adjusted score (DSCORE) and future projection (FUT) columns
+        cols = ("move", "score", "dscore", "future", "exp_dmg", "acc", "eff", "first", "opp", "note")
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=12)
-        hdrs = ("MOVE", "SCORE", "EXP", "ACC", "EFF", "FIRST", "OPP", "WHY/NOTE")
-        widths = (200, 80, 70, 60, 60, 60, 60, 260)
+        hdrs = ("MOVE", "SCORE", "DSCORE", "FUT", "EXP", "ACC", "EFF", "FIRST", "OPP", "WHY/NOTE")
+        widths = (180, 70, 70, 60, 60, 50, 50, 60, 60, 240)
         for c, h, w in zip(cols, hdrs, widths):
             tree.heading(c, text=h)
             tree.column(c, width=w, anchor=tk.W)
@@ -257,21 +348,16 @@ class StockfishWindow(tk.Toplevel):
 
         self.player = player
 
+        # Apply verbose flag if set in UI/env
         try:
-            attached = False
-            for attr in ("on_think", "think_callback", "on_think_hook"):
-                if hasattr(self.player, attr):
-                    setattr(self.player, attr, self._on_think)
-                    attached = True; break
-            if not attached:
-                for meth in ("set_on_think", "set_think_callback", "register_think_callback", "on_think_connect"):
-                    fn = getattr(self.player, meth, None)
-                    if callable(fn):
-                        fn(self._on_think); attached = True; break
-            if not attached:
-                self._append_log("Note: model exposes no on_think hook; Thinking tab will use fallback per turn.")
-        except Exception as e:
-            self._append_log(f"Could not attach think callback: {e}")
+            if bool(self.verbose_var.get()) and getattr(self.player, 'engine', None):
+                self.player.engine.set_verbose(True)
+            # apply initial softmin temp
+            if getattr(self.player, 'engine', None) and hasattr(self.player.engine, 'set_softmin_temperature'):
+                try: self.player.engine.set_softmin_temperature(float(self.softmin_temp_var.get()))
+                except Exception: pass
+        except Exception:
+            pass
 
         try:
             self.player.logger.addHandler(self.log_handler)
@@ -279,12 +365,11 @@ class StockfishWindow(tk.Toplevel):
         except Exception:
             pass
         try:
-            if not getattr(self, "_root_log_handler_attached", False):
-                root = logging.getLogger()
-                root.addHandler(self.log_handler)
-                if root.level > logging.INFO:
-                    root.setLevel(logging.INFO)
-                self._root_log_handler_attached = True
+            # Also capture ThinkVerbose logger output
+            tv = logging.getLogger('ThinkVerbose')
+            tv.addHandler(self.log_handler)
+            if tv.level > logging.INFO:
+                tv.setLevel(logging.INFO)
         except Exception:
             pass
 
@@ -347,7 +432,43 @@ class StockfishWindow(tk.Toplevel):
             self._append_log(f"Forfeit fallback failed: {e}")
 
     async def _timer_all(self, on: bool):
-        if self.player: await self.player.timer_all(on)
+        p = self.player
+        if not p:
+            return
+        # Try native player method first
+        try:
+            m = getattr(p, "timer_all", None)
+            if callable(m):
+                await m(on)
+                self._append_log(f"Called player.timer_all({on}).")
+                return
+        except Exception as e:
+            self._append_log(f"player.timer_all({on}) failed: {e} — falling back to direct /timer command.")
+        # Fallback: manually send /timer on|off to all battle rooms
+        try:
+            client = getattr(p, "ps_client", None) or getattr(p, "_client", None)
+            if not client:
+                raise RuntimeError("PSClient missing on player")
+            battles = getattr(p, "battles", {}) or {}
+            rooms: List[str] = []
+            for key, battle in list(battles.items()):
+                room_id = getattr(battle, "battle_tag", None) or getattr(battle, "room_id", None) or str(key)
+                if room_id:
+                    rooms.append(room_id)
+            if not rooms:
+                self._append_log("No active battle rooms found for /timer.")
+                return
+            cmd = "/timer on" if on else "/timer off"
+            sent = 0
+            for r in rooms:
+                try:
+                    await client.send_message(cmd, room=r)
+                    sent += 1
+                except Exception as e2:
+                    self._append_log(f"Failed to send {cmd} to {r}: {e2}")
+            self._append_log(f"Sent {cmd} to {sent} room(s).")
+        except Exception as e:
+            self._append_log(f"Timer fallback failed: {e}")
 
     def _on_depth_changed(self):
         if self.player:
@@ -359,6 +480,79 @@ class StockfishWindow(tk.Toplevel):
                     self.player.set_depth(int(self.depth_var.get()))
             except Exception:
                 pass
+        self._save_prefs()
+
+    def _on_branch_changed(self):
+        if self.player:
+            try:
+                eng = getattr(self.player, "engine", None)
+                if eng and hasattr(eng, "set_branching"):
+                    eng.set_branching(int(self.branch_var.get()))
+            except Exception:
+                pass
+        self._save_prefs()
+
+    def _on_softmin_changed(self):
+        if self.player:
+            try:
+                eng = getattr(self.player, 'engine', None)
+                if eng and hasattr(eng, 'set_softmin_temperature'):
+                    eng.set_softmin_temperature(float(self.softmin_temp_var.get()))
+            except Exception:
+                pass
+        self._save_prefs()
+
+    def _on_battle_select(self):
+        # User manually picked a battle; update active battle id and refresh snapshot
+        bid = self.battle_choice_var.get().strip()
+        if not bid or not self.player: return
+        self._active_battle_id = bid
+        try:
+            battle = self.player.battles.get(bid)
+            if battle:
+                from Data.poke_env_battle_environment import snapshot as snapshot_battle  # local import to avoid cycle
+                try: self._latest_snapshot = snapshot_battle(battle)
+                except Exception: pass
+                self._refresh_teams(); self._refresh_thinking()
+        except Exception: pass
+
+    def _on_verbose_toggle(self):
+        v = bool(self.verbose_var.get())
+        try:
+            if self.player and getattr(self.player, 'engine', None):
+                try: self.player.engine.set_verbose(v)
+                except Exception: pass
+        except Exception: pass
+        try: os.environ['POKECHAD_THINK_DEBUG'] = '1' if v else '0'
+        except Exception: pass
+        self._append_log(f"Verbose think {'ENABLED' if v else 'DISABLED'}")
+        self._save_prefs()
+
+    def _on_tree_trace_toggle(self):
+        t = bool(self.tree_trace_var.get())
+        try: os.environ['POKECHAD_TREE_TRACE'] = '1' if t else '0'
+        except Exception: pass
+        self._append_log(f"Tree trace {'ENABLED' if t else 'DISABLED'} (takes effect next think cycle)")
+        self._save_prefs()
+
+    def _reset_ui(self):
+        """Clear UI state so next battle starts with a clean slate."""
+        try:
+            self._latest_think = {}
+            self._latest_snapshot = {}
+            self._last_fallback_turn = None
+            self._last_real_think_turn = None
+            # Clear trees
+            for tree in (self.cand_tree, self.switch_tree, self.team_tree, self.opp_tree):
+                try: self._reload_tree(tree)
+                except Exception: pass
+            # Clear logs text (keep telemetry file)
+            try:
+                self.logs_text.delete('1.0', tk.END)
+            except Exception: pass
+            self._append_log("[reset] UI state cleared; ready for next battle.")
+        except Exception as e:
+            self._append_log(f"[reset] Failed: {e}")
 
     # ---------- Train / Reload ----------
     def _train_weights(self):
@@ -406,6 +600,7 @@ class StockfishWindow(tk.Toplevel):
                     "turn": think.get("turn") or self._latest_snapshot.get("turn"),
                     "picked": think.get("picked"),
                     "order": think.get("order"),
+                    "switch_meta": think.get("switch_meta"),  # added for switch weight training
                     "snapshot": self._latest_snapshot,
                 }
                 with open(self._telemetry_path, "a", encoding="utf-8") as f:
@@ -423,28 +618,33 @@ class StockfishWindow(tk.Toplevel):
         for d in self._latest_think.get("candidates", []):
             try:
                 move = d.get("name") or d.get("id") or d.get("move") or d.get("move_id")
-                s = d.get("score"); score = f"{float(s):.2f}" if s is not None else ""
-                exp = ""; 
+                raw_score = d.get("score")
+                depth_score = d.get("score_depth", raw_score)
+                future = d.get("future_proj")
+                score = f"{float(raw_score):.2f}" if raw_score is not None else ""
+                dscore = f"{float(depth_score):.2f}" if depth_score is not None else ""
+                fut = f"{float(future):.2f}" if future is not None else ""
+                exp = "";
                 for k in ("exp_dmg", "expected", "exp", "expdmg", "expected_damage"):
                     if d.get(k) is not None:
                         exp = f"{float(d.get(k)):.2f}"; break
-                acc = ""; 
+                acc = "";
                 for k in ("acc", "acc_mult", "accuracy", "hit_chance"):
                     if d.get(k) is not None:
                         acc = f"{float(d.get(k)):.2f}"; break
-                eff = ""; 
+                eff = "";
                 for k in ("eff", "effectiveness", "type_mult", "type_effectiveness"):
                     if d.get(k) is not None:
                         eff = f"{float(d.get(k)):.2f}"; break
-                first = ""; 
+                first = "";
                 if d.get("first_prob") is not None: first = f"{float(d.get('first_prob')):.2f}"
-                opp = ""; 
+                opp = "";
                 if d.get("opp_counter_ev") is not None: opp = f"{float(d.get('opp_counter_ev')):.2f}"
                 note = d.get("why_blocked") or d.get("note") or d.get("why") or ""
-                self.cand_tree.insert("", tk.END, values=(move, score, exp, acc, eff, first, opp, note))
+                self.cand_tree.insert("", tk.END, values=(move, score, dscore, fut, exp, acc, eff, first, opp, note))
             except Exception:
                 try:
-                    self.cand_tree.insert("", tk.END, values=(str(d), "", "", "", "", "", "", ""))
+                    self.cand_tree.insert("", tk.END, values=(str(d), "", "", "", "", "", "", "", "", ""))
                 except Exception:
                     pass
 
@@ -476,13 +676,15 @@ class StockfishWindow(tk.Toplevel):
             boosts = pretty_boosts(p.get("boosts"))
             hp = p.get("hp_fraction")
             hp_s = f"{int(round(hp * 100))}%" if isinstance(hp, (int, float)) else ""
-            self.team_tree.insert("", tk.END, values=(sid, p.get("species"), hp_s, str(p.get("status") or ""), boosts))
+            active_flag = "*" if p.get("is_active") else ""
+            self.team_tree.insert("", tk.END, values=(sid, active_flag, p.get("species"), hp_s, str(p.get("status") or ""), boosts))
         self._reload_tree(self.opp_tree)
         for sid, p in (snap.get("opp_team") or {}).items():
             boosts = pretty_boosts(p.get("boosts"))
             hp = p.get("hp_fraction")
             hp_s = f"{int(round(hp * 100))}%" if isinstance(hp, (int, float)) else ""
-            self.opp_tree.insert("", tk.END, values=(sid, p.get("species"), hp_s, str(p.get("status") or ""), boosts))
+            active_flag = "*" if p.get("is_active") else ""
+            self.opp_tree.insert("", tk.END, values=(sid, active_flag, p.get("species"), hp_s, str(p.get("status") or ""), boosts))
 
     def _reload_tree(self, tree: ttk.Treeview):
         try:
@@ -495,36 +697,69 @@ class StockfishWindow(tk.Toplevel):
     def _find_active_battle(self):
         p = getattr(self, "player", None)
         if not p: return None
-        for name in ("current_battle", "battle", "active_battle"):
-            b = getattr(p, name, None)
-            if b is not None: return b
         battles = getattr(p, "battles", None)
-        if isinstance(battles, dict) and battles:
-            try:
-                for b in battles.values():
-                    if getattr(b, "active_pokemon", None) is not None or getattr(b, "turn", None):
-                        return b
-                return list(battles.values())[-1]
-            except Exception:
-                try: return next(iter(battles.values()))
-                except Exception: return None
-        return None
+        if not isinstance(battles, dict) or not battles:
+            return None
+        # Update selector list with current battles
+        ids = list(battles.keys())
+        try:
+            self.battle_combo.configure(values=ids)
+            # Preserve selection; if none selected or selection gone, pick first unfinished
+            if not self._active_battle_id or self._active_battle_id not in ids:
+                # prefer unfinished battle
+                for bid, b in battles.items():
+                    if not getattr(b, 'finished', False):
+                        self._active_battle_id = bid; break
+                else:
+                    # fallback last id
+                    self._active_battle_id = ids[-1]
+                self.battle_choice_var.set(self._active_battle_id)
+        except Exception: pass
+        # Choose the active battle respecting user override
+        battle = battles.get(self._active_battle_id)
+        # If chosen battle finished and there is another unfinished, switch automatically
+        if battle and getattr(battle,'finished', False):
+            for bid,b in battles.items():
+                if not getattr(b,'finished', False):
+                    self._active_battle_id = bid
+                    self.battle_choice_var.set(bid)
+                    battle = b
+                    break
+        return battle
 
     def _poll_battle(self):
         try:
             if not self.winfo_exists(): return
             b = self._find_active_battle()
             if b is not None:
-                try: snap = snapshot_battle(b); self._latest_snapshot = snap
-                except Exception: snap = None
-                try: self._refresh_teams()
-                except Exception: pass
-                try:
-                    turn = int(snap.get("turn")) if snap else None
-                except Exception:
-                    turn = None
-                if turn is not None and turn != self._last_fallback_turn and turn != self._last_real_think_turn:
-                    self._emit_fallback_think(b, snap); self._last_fallback_turn = turn
+                # Detect battle finished transition
+                finished = bool(getattr(b,'finished', False))
+                bid = getattr(b,'battle_tag', getattr(b,'room_id', None))
+                if finished and bid and bid not in self._finished_battles:
+                    self._finished_battles.add(bid)
+                    self._append_log(f"[battle] Finished: {bid} (winner={getattr(b,'won', None)})")
+                if not finished:
+                    try:
+                        from Data.poke_env_battle_environment import snapshot as snapshot_battle
+                        snap = snapshot_battle(b); self._latest_snapshot = snap
+                    except Exception: snap = None
+                    try: self._refresh_teams()
+                    except Exception: pass
+                    try:
+                        turn = int(snap.get("turn")) if snap else None
+                    except Exception:
+                        turn = None
+                    if turn is not None and turn != self._last_fallback_turn and turn != self._last_real_think_turn:
+                        self._emit_fallback_think(b, snap); self._last_fallback_turn = turn
+                else:
+                    # Finished: if there is another unfinished battle, UI will swap next poll; otherwise allow new games without restart
+                    pass
+            else:
+                # No battles active; clear selection state (leave past logs) but enable new games
+                if self._active_battle_id is not None:
+                    self._append_log("[battle] No active battles. Ready for a new game.")
+                self._active_battle_id = None
+                self.battle_choice_var.set("")
         finally:
             if self.winfo_exists():
                 try: h = self.after(500, self._poll_battle); self._scheduled_tasks.append(h)
@@ -581,6 +816,7 @@ class StockfishWindow(tk.Toplevel):
 
     # ---------- Shutdown ----------
     def _on_close(self):
+        self._save_prefs()
         for h in self._scheduled_tasks:
             try: self.after_cancel(h)
             except Exception: pass

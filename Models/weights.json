@@ -1,7 +1,11 @@
 {
-  "go_first_bonus": 0.15,
-  "opp_dmg_penalty": 0.5,
-  "survival_bonus": 0.6,
-  "switch_resist_bonus": 1.0,
-  "switch_hazard_penalty": 0.8
+  "expected_mult": 3.0,
+  "go_first_bonus": 1.5483833976894905,
+  "opp_dmg_penalty": 3.0,
+  "survival_bonus": 1.1460603140436911,
+  "accuracy_mult": 0.8203104697844953,
+  "effectiveness_mult": 2.5,
+  "ko_bonus": 2.950787633279399,
+  "switch_outgoing_mult": 3.0,
+  "switch_incoming_penalty": 3.0
 }

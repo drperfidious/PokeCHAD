@@ -129,6 +129,16 @@ def snapshot(battle) -> Dict[str, Any]:
         "opp_side_conditions": _extract_side_conditions(getattr(battle, "opponent_side_conditions", None) or getattr(battle, "opponent_side", None)),
     }
 
+    # Determine active references for quick flagging
+    try:
+        _active_me = getattr(battle, "active_pokemon", None)
+    except Exception:
+        _active_me = None
+    try:
+        _active_opp = getattr(battle, "opponent_active_pokemon", None)
+    except Exception:
+        _active_opp = None
+
     # Team snapshots
     team = getattr(battle, "team", {}) or {}
     for sid, p in team.items():
@@ -142,6 +152,7 @@ def snapshot(battle) -> Dict[str, Any]:
             "item": getattr(p, "item", None),
             "ability": getattr(p, "ability", None),
             "revealed_moves": [getattr(m, "id", None) for m in (getattr(p, "moves", None) or {}).values()],
+            "is_active": bool(p is _active_me),
         }
 
     opp_team = getattr(battle, "opponent_team", {}) or {}
@@ -156,6 +167,7 @@ def snapshot(battle) -> Dict[str, Any]:
             "item": getattr(p, "item", None),
             "ability": getattr(p, "ability", None),
             "revealed_moves": [getattr(m, "id", None) for m in (getattr(p, "moves", None) or {}).values()],
+            "is_active": bool(p is _active_opp),
         }
 
     # Actions available

@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
     pe_stats = None
     def to_id_str(s: str) -> str:
         return "".join(ch.lower() for ch in s if ch.isalnum())
+from . import dex_registry  # lazy access to Showdown item data
 
 
 @dataclass
@@ -247,5 +248,31 @@ def apply_item_stat_modifiers(pinfo: "PokemonInfo", species: str, item: Optional
             spa = spa * 2
         elif it == "deepseascale":
             spd = spd * 2
-
+    # Additional species/item-aware modifiers using Showdown data (if available)
+    # Metal Powder: Ditto Def/SpD x1.5 when not transformed
+    if it == "metalpowder" and sid == "ditto":
+        # Transformation volatile not tracked here; assume untransformed if item present
+        deff = int(deff * 1.5)
+        spd = int(spd * 1.5)
+    # Quick Powder: Ditto Speed x2 when untransformed
+    if it == "quickpowder" and sid == "ditto":
+        spe = int(spe * 2)
+    # Soul Dew: Latias/Latios SpA/SpD x1.2 (modern effect)
+    if it == "souldew" and sid in {"latias","latios"}:
+        spa = int(spa * 1.2)
+        spd = int(spd * 1.2)
+    # Use dex_registry for any explicit stat modifiers encoded (future-proof)
+    try:
+        data = dex_registry.get_item(it)
+        if isinstance(data, dict):
+            # Custom extension: if item data has keys like 'boostAtk':1.5 etc.
+            for key, mult in data.items():
+                if not isinstance(mult, (int, float)): continue
+                if key.lower() == 'boostatk': atk = int(atk * mult)
+                elif key.lower() == 'boostdef': deff = int(deff * mult)
+                elif key.lower() == 'boostspa': spa = int(spa * mult)
+                elif key.lower() == 'boostspd': spd = int(spd * mult)
+                elif key.lower() == 'boostspe': spe = int(spe * mult)
+    except Exception:
+        pass
     return PokemonStats(hp, atk, deff, spa, spd, spe)

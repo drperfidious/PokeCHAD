@@ -21,6 +21,6 @@ import asyncio
 
 class GPTModel:
     """GPT-based model for Pokemon battle AI"""
-
+    
     def __init__(self):
         pass

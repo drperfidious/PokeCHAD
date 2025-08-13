@@ -1,4 +1,3 @@
-
 # team_state.py
 """
 Structured state objects for ally and opponent Pokémon in poke-env battles.
@@ -393,6 +392,8 @@ class TeamState:
         # --- PATCH: merge available_switches (bench) into state & copy revealed moves ---
         try:
             bench = getattr(battle, "available_switches", None) or []
+            # Determine our side role if available (poke-env sets _player_role to 'p1' or 'p2')
+            role = getattr(battle, "_player_role", None) or getattr(battle, "player_role", None) or "p1"
             for p in bench:
                 species = getattr(p, "species", None) or getattr(p, "name", None) or str(p)
                 if not species:
@@ -404,9 +405,13 @@ class TeamState:
                         match_key = k
                         break
                 if match_key is None:
-                    # Create a new entry if we didn't see it in battle.team
+                    # Prefer a side-qualified key to disambiguate mirror species; also add a plain species key if free.
+                    qualified_key = f"{role}: {species}"
                     try:
-                        ours[f"p1: {species}"] = PokemonState.from_ally(battle, p, gendata)
+                        ours[qualified_key] = PokemonState.from_ally(battle, p, gendata)
+                        # Optionally install species-only alias if not present (for legacy lookup paths)
+                        if species not in ours:
+                            ours[species] = ours[qualified_key]
                     except Exception:
                         pass
                     continue
