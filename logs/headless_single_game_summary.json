@@ -1,0 +1,13 @@
+{
+  "username": "Containedo3mini",
+  "format": "gen9randombattle",
+  "won": false,
+  "turns": 38,
+  "total_decisions": 42,
+  "ko_move_fraction": 0.0,
+  "avg_candidate_score": -0.07704728731528221,
+  "avg_first_probability": null,
+  "duration_sec": 121.78,
+  "ladder_error": null,
+  "battle_finished": true
+}

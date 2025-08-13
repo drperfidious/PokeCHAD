@@ -1,0 +1,2 @@
+{"event": "init", "champion": {"expected_mult": 1.0, "go_first_bonus": 0.4, "opp_dmg_penalty": 1.0, "survival_bonus": 0.0, "accuracy_mult": 0.0, "effectiveness_mult": 0.0, "ko_bonus": 1.0, "switch_outgoing_mult": 1.0, "switch_incoming_penalty": 1.0}}
+{"event": "gen_start", "generation": 1, "champion_wr": 0.5, "champion": {"expected_mult": 1.0, "go_first_bonus": 0.4, "opp_dmg_penalty": 1.0, "survival_bonus": 0.0, "accuracy_mult": 0.0, "effectiveness_mult": 0.0, "ko_bonus": 1.0, "switch_outgoing_mult": 1.0, "switch_incoming_penalty": 1.0}, "sigma": 1.0}

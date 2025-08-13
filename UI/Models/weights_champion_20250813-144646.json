@@ -1,0 +1,11 @@
+{
+  "expected_mult": 2.8098066382073403,
+  "go_first_bonus": 0.6826898214417936,
+  "opp_dmg_penalty": 3.0,
+  "survival_bonus": 1.3349534824307514,
+  "accuracy_mult": 0.7749810338101651,
+  "effectiveness_mult": 2.5,
+  "ko_bonus": 2.8150406332124946,
+  "switch_outgoing_mult": 1.282661303068442,
+  "switch_incoming_penalty": 3.0
+}
