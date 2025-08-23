@@ -22,6 +22,15 @@ except Exception:  # pragma: no cover - allow type checking without poke-env
     def compute_raw_stats(species: str, evs: List[int], ivs: List[int], level: int, nature: str, data: Any) -> List[int]:  # type: ignore
         raise RuntimeError("poke-env not installed: compute_raw_stats unavailable")
 
+# --- NEW: Random Battle set assignment utilities ---
+try:
+    from utils.random_sets import is_random_format, choose_random_set
+except Exception:  # pragma: no cover
+    def is_random_format(fmt: Optional[str]) -> bool:  # type: ignore
+        return False
+    def choose_random_set(species: str, fmt_or_gen):  # type: ignore
+        return None
+
 STATS = ("hp","atk","def","spa","spd","spe")
 DEFAULT_IVS = [31,31,31,31,31,31]
 
@@ -51,6 +60,17 @@ def _guess_level_from_format(battle_format: Optional[str]) -> int:
     if "vgc" in fmt or "doubles" in fmt:
         return 50
     return 100
+
+# --- NEW: minimal move lookup from GenData to enrich provisional moves ---
+def _lookup_move_from_gendata(gendata: GenData, move_id: str) -> Dict[str, Any]:
+    try:
+        mv = getattr(gendata, "moves", {}).get(to_id_str(move_id), {})
+        if not isinstance(mv, dict):
+            return {}
+        return mv
+    except Exception:
+        return {}
+
 
 def _coerce_evs(evs: Optional[Sequence[int] or Dict[str,int]]) -> List[int]:
     if isinstance(evs, dict):
@@ -134,6 +154,7 @@ class PokemonState:
     item: Optional[str] = None
     consumed_item: Optional[str] = None
     tera_type: Optional[str] = None
+    terastallized: bool = False
     max_hp: Optional[int] = None
     current_hp: Optional[int] = None
     hp_fraction: Optional[float] = None
@@ -170,6 +191,7 @@ class PokemonState:
         nickname = getattr(mon, "nickname", None) or getattr(mon, "name", None)
         types = _species_types(gen_data, species)
         tera_type = to_id_str(getattr(mon, "tera_type", None) or getattr(mon, "terastallized_type", None) or "") or None
+        terastallized = bool(getattr(mon, "terastallized", False))
 
         ability = to_id_str(getattr(mon, "ability", None) or "")
         item = to_id_str(getattr(mon, "item", None) or "") or None
@@ -252,7 +274,7 @@ class PokemonState:
 
         return cls(
             species=str(species), nickname=nickname, types=types, ability=ability or None,
-            item=item, tera_type=tera_type, max_hp=max_hp, current_hp=current_hp, hp_fraction=hp_fraction,
+            item=item, tera_type=tera_type, terastallized=terastallized, max_hp=max_hp, current_hp=current_hp, hp_fraction=hp_fraction,
             status=status, volatiles=set(vol_raw), is_active=is_active,
             is_trapped=bool(is_trapped) if is_trapped is not None else None,
             has_priority_block=(ability in {'dazzling','queenlymajesty','armortail'}),
@@ -265,6 +287,7 @@ class PokemonState:
         nickname = getattr(mon, "nickname", None) or getattr(mon, "name", None)
         types = _species_types(gen_data, species)
         tera_type = to_id_str(getattr(mon, "tera_type", None) or getattr(mon, "terastallized_type", None) or "") or None
+        terastallized = bool(getattr(mon, "terastallized", False))
 
         ability = to_id_str(getattr(mon, "ability", None) or "") or None
         item = to_id_str(getattr(mon, "item", None) or "") or None
@@ -302,11 +325,12 @@ class PokemonState:
         elif ev_policy == "max_special": main_offense = "spa"
 
         evs = [0,0,0,0,0,0]; ivs = DEFAULT_IVS[:]; nature = "serious"
-        if ev_policy in ("auto","max_offense","max_physical","max_special"):
+        if ev_policy in ("auto","max_offense","max_physical","max_special","balanced"):
+            # Prefer +Speed nature when uncertain to avoid underestimating opponent Speed
             if main_offense == "atk":
-                evs = [4,252,0,0,0,252]; nature = "adamant"
+                evs = [4,252,0,0,0,252]; nature = "jolly"
             else:
-                evs = [4,0,0,252,0,252]; nature = "modest"
+                evs = [4,0,0,252,0,252]; nature = "timid"
         elif ev_policy == "balanced":
             evs = [252,0,0,0,4,252]; nature = "jolly"
 
@@ -352,7 +376,7 @@ class PokemonState:
 
         return cls(
             species=str(species), nickname=nickname, types=types, ability=ability,
-            ability_options=ability_options or None, item=item, tera_type=tera_type,
+            ability_options=ability_options or None, item=item, tera_type=tera_type, terastallized=terastallized,
             max_hp=max_hp, current_hp=current_hp, hp_fraction=hp_fraction, status=status,
             volatiles=set(vol_raw), is_active=is_active,
             is_trapped=bool(is_trapped) if is_trapped is not None else None,
@@ -439,4 +463,142 @@ class TeamState:
         except Exception:
             pass
         # --- END PATCH ---
+
+        # --- NEW PATCH: ensure current actives exist in our dictionaries and are flagged ---
+        try:
+            # Ally active
+            active_me = getattr(battle, "active_pokemon", None)
+            if active_me is not None:
+                # If none marked active, try to mark by species match or inject
+                if not any(getattr(ps, 'is_active', False) for ps in ours.values()):
+                    spec = getattr(active_me, 'species', None)
+                    matched = False
+                    if spec:
+                        for k, ps in ours.items():
+                            if str(ps.species).lower() == str(spec).lower() and getattr(ps, 'current_hp', 1) != 0:
+                                ps.is_active = True
+                                matched = True
+                                break
+                    if not matched:
+                        role = getattr(battle, "_player_role", None) or getattr(battle, "player_role", None) or "p1"
+                        key = f"{role}: {getattr(active_me, 'species', 'unknown')}"
+                        try:
+                            ours[key] = PokemonState.from_ally(battle, active_me, gendata)
+                            ours[key].is_active = True
+                        except Exception:
+                            pass
+            # Opponent active
+            active_opp = getattr(battle, "opponent_active_pokemon", None)
+            if active_opp is not None:
+                if not any(getattr(ps, 'is_active', False) for ps in opponents.values()):
+                    spec = getattr(active_opp, 'species', None) or getattr(active_opp, 'base_species', None)
+                    matched = False
+                    if spec:
+                        for k, ps in opponents.items():
+                            if str(ps.species).lower() == str(spec).lower() and getattr(ps, 'current_hp', 1) != 0:
+                                ps.is_active = True
+                                matched = True
+                                break
+                    if not matched:
+                        # Try to infer opponent role
+                        opp_role = 'p2' if (getattr(battle, "_player_role", None) or getattr(battle, "player_role", None) or "p1") == 'p1' else 'p1'
+                        key = f"{opp_role}: {getattr(active_opp, 'species', getattr(active_opp, 'base_species', 'unknown'))}"
+                        try:
+                            opponents[key] = PokemonState.from_opponent(battle, active_opp, gendata, ev_policy=ev_policy)
+                            opponents[key].is_active = True
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # --- END NEW PATCH ---
+
+        # --- NEW: Random Battle provisional set injection for opponents ---
+        try:
+            fmt = getattr(battle, 'format', None) or getattr(battle, 'battle_format', None)
+            if is_random_format(fmt):
+                # Stable seed per battle/species for deterministic choices across turns
+                seed_base = getattr(battle, 'battle_tag', None) or getattr(battle, 'room_id', None) or 'local'
+                for k, ps in opponents.items():
+                    try:
+                        # Always pick a deterministic provisional set for this species
+                        chosen = choose_random_set(ps.species, fmt, seed=f"{seed_base}:{ps.species}")
+                        if not chosen:
+                            continue
+                        # Populate ability/item only if unknown
+                        if not ps.ability and getattr(chosen, 'ability', None):
+                            ps.ability = to_id_str(chosen.ability)
+                        if not ps.item and getattr(chosen, 'item', None):
+                            ps.item = to_id_str(chosen.item)
+                        # Recompute stats if level/EVs/IVs/nature present
+                        level = ps.stats.level
+                        evs = [ps.stats.evs.get(x, 0) for x in STATS]
+                        ivs = [ps.stats.ivs.get(x, 31) for x in STATS]
+                        nature = ps.stats.nature or 'serious'
+                        if getattr(chosen, 'level', None):
+                            try: level = int(chosen.level)
+                            except Exception: pass
+                        if getattr(chosen, 'evs', None):
+                            evs = _coerce_evs(chosen.evs)
+                        if getattr(chosen, 'ivs', None):
+                            ivs = _coerce_ivs(chosen.ivs)
+                        if getattr(chosen, 'nature', None):
+                            nature = to_id_str(chosen.nature)
+                        try:
+                            arr = compute_raw_stats(species=ps.species, evs=evs, ivs=ivs, level=level, nature=nature, data=gendata)
+                            raw = {kk: int(arr[i]) for i, kk in enumerate(STATS)}
+                            ps.stats.raw = raw
+                            ps.stats.level = level
+                            ps.stats.evs = {kk: int(evs[i]) for i, kk in enumerate(STATS)}
+                            ps.stats.ivs = {kk: int(ivs[i]) for i, kk in enumerate(STATS)}
+                            ps.stats.nature = nature
+                            if ps.max_hp is None:
+                                ps.max_hp = raw['hp']
+                            if ps.current_hp is None and ps.hp_fraction is not None and ps.max_hp:
+                                ps.current_hp = int(round(ps.max_hp * float(ps.hp_fraction)))
+                            if ps.current_hp is None and ps.max_hp is not None and (ps.status or '').lower() != 'fnt':
+                                ps.current_hp = int(ps.max_hp)
+                                ps.hp_fraction = 1.0
+                        except Exception:
+                            pass
+                        # Build combined move list: keep revealed moves, fill the rest from chosen set
+                        revealed_ids = []
+                        for mv in (ps.moves or []):
+                            mid = getattr(mv, 'id', None)
+                            if mid: revealed_ids.append(to_id_str(mid))
+                        # If no revealed moves, assign full chosen set
+                        target_ids: List[str] = []
+                        if not revealed_ids:
+                            target_ids = list((getattr(chosen, 'moves', None) or [])[:4])
+                        else:
+                            target_ids = list(revealed_ids)
+                            for mid in (getattr(chosen, 'moves', None) or []):
+                                mid_id = to_id_str(mid)
+                                if mid_id not in target_ids:
+                                    target_ids.append(mid_id)
+                                if len(target_ids) >= 4:
+                                    break
+                        # Create MoveSlots with metadata from GenData for all target_ids
+                        slots: List[MoveSlot] = []
+                        for mid in target_ids[:4]:
+                            mvraw = _lookup_move_from_gendata(gendata, mid)
+                            slots.append(MoveSlot(
+                                id=to_id_str(mid),
+                                name=mvraw.get('name'),
+                                type=to_id_str(mvraw.get('type') or '') or None,
+                                category=to_id_str(mvraw.get('category') or '') or None,
+                                base_power=int(mvraw.get('basePower') or 0) or None,
+                                accuracy=float(mvraw.get('accuracy') or 100) if (mvraw.get('accuracy') is not None) else None,
+                                pp=int(mvraw.get('pp') or 0) or None,
+                                max_pp=int(mvraw.get('pp') or 0) or None,
+                                priority=int(mvraw.get('priority') or 0) or None,
+                                target=mvraw.get('target'),
+                            ))
+                        if slots:
+                            ps.moves = slots
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        # --- END Random Battle provisional set injection ---
+
         return cls(ours=ours, opponent=opponents)

@@ -60,40 +60,57 @@ class FieldState:
 
 # --------------------------- Type effectiveness --------------------------------
 
+def get_defending_types(defender_types: Sequence[str], tera_type: Optional[str] = None, terastallized: bool = False) -> Sequence[str]:
+    """Get the effective defending types, accounting for terastallization.
+    
+    When a Pokemon is terastallized, its defending type(s) become just the tera type.
+    """
+    if terastallized and tera_type:
+        return [tera_type.capitalize()]
+    return defender_types
+
 def type_effectiveness(
     move_type: str,
     defender_types: Sequence[str],
     type_chart: Dict[str, Dict[str, float]],
     move_id: Optional[str] = None,
+    defender_tera_type: Optional[str] = None,
+    defender_terastallized: bool = False,
 ) -> float:
     """Return the Gen 9 effectiveness multiplier for a move against defender types.
 
     Special cases:
       - Freeze-Dry (move_id == 'freezedry'): always super-effective vs Water (x2).
       - Flying Press (move_id == 'flyingpress'): combine Fighting *and* Flying.
+      - Terastallization: When defender is terastallized, uses only the tera type.
 
     Args:
         move_type: Canonical type name, e.g., 'Water', 'Fire'. Case-insensitive.
         defender_types: Defender's types (1 or 2). Type names, case-insensitive.
         type_chart: Mapping Type -> vsType -> multiplier (e.g., GenData.type_chart).
         move_id: Showdown id for certain special-case moves.
+        defender_tera_type: Defender's tera type if available.
+        defender_terastallized: Whether the defender is currently terastallized.
     """
-    if not defender_types:
+    # Get effective defending types (accounts for terastallization)
+    effective_types = get_defending_types(defender_types, defender_tera_type, defender_terastallized)
+    
+    if not effective_types:
         return 1.0
 
     mtype = move_type.capitalize()
 
-    # Helper to multiply vs both defender types
+    # Helper to multiply vs effective defender types
     def mult_for(att_type: str) -> float:
         mult = 1.0
-        for d in defender_types:
+        for d in effective_types:
             mult *= type_chart.get(att_type, {}).get(d.capitalize(), 1.0)
         return mult
 
     # Special: Freeze-Dry
     if move_id == "freezedry":
         base = mult_for("Ice")
-        if "Water" in [t.capitalize() for t in defender_types]:
+        if "Water" in [t.capitalize() for t in effective_types]:
             base *= 2.0
         return base
 
@@ -236,35 +253,33 @@ def stab_multiplier(
     user_types: Sequence[str],
     tera_type: Optional[str] = None,
     ability: Optional[str] = None,
+    *,
+    terastallized: bool = False,
 ) -> float:
     """Compute STAB for move_type with Tera and Adaptability rules (Gen 9).
 
     Rules:
       - Normal STAB is 1.5 if move matches any of user's original types.
-      - Terastallizing grants STAB for the Tera type.
-      - If the Tera type equals an original type AND the move matches that type,
-        STAB becomes 2.0 (not 1.5 * 1.5).
       - Adaptability (pre-Tera): STAB becomes 2.0 for matching original type.
-      - Adaptability (Tera): applies only to the Tera type.
-           * If Tera matches an original type and the move matches it -> 2.25
-           * If Tera is a new type and the move matches it -> 2.0
-           * Original types stay 1.5 under Adaptability when Tera is different.
+      - Terastallizing grants STAB for the Tera type only when terastallized.
+      - If the Tera type equals an original type AND the move matches that type
+        (while terastallized), STAB becomes 2.0 (or 2.25 with Adaptability).
+      - If Tera is a new type, you still retain original 1.5 (or 2.0 with Adaptability)
+        on original types, and gain 1.5 (or 2.0 with Adaptability) on the Tera type only.
     """
     mtype = move_type.capitalize()
     orig = {t.capitalize() for t in user_types if t}
     ter = tera_type.capitalize() if tera_type else None
     abil = (ability or "").lower()
 
-    # If the move doesn't match Tera type:
-    if ter is None or mtype != ter:
-        if mtype in orig:
-            return 2.0 if abil == "adaptability" else 1.5
-        return 1.0
+    # Base: original STAB (pre-Tera)
+    base = 2.0 if (mtype in orig and abil == "adaptability") else (1.5 if mtype in orig else 1.0)
 
-    # Move matches Tera type
-    tera_matches_original = ter in orig
-    if abil == "adaptability":
-        return 2.25 if tera_matches_original else 2.0
+    # Tera STAB applies only when terastallized and move matches the Tera type
+    if terastallized and ter and mtype == ter:
+        tera_matches_original = ter in orig
+        if abil == "adaptability":
+            return 2.25 if tera_matches_original else 2.0
+        return 2.0 if tera_matches_original else 1.5
 
-    # No Adaptability
-    return 2.0 if tera_matches_original else 1.5
+    return base

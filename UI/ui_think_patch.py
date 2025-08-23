@@ -123,27 +123,29 @@ def _tc_to_attack_matrix(tc: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
             atk_mat[A].setdefault(D, 1.0)
     return atk_mat
 
-def _fixed_type_effectiveness(atk_type: str, dfd_types: List[str] | tuple[str, ...] | None, tc: Dict[str, Any]) -> float:
+def _fixed_type_effectiveness(move_type: str, defender_types: List[str] | tuple[str, ...] | None, type_chart: Dict[str, Any], 
+                             move_id: Optional[str] = None, defender_tera_type: Optional[str] = None,
+                             defender_terastallized: bool = False) -> float:
     # Robust replacement; never raises.
-    if not atk_type:
+    if not move_type:
         return 1.0
-    A = _norm_type_name(atk_type)
+    A = _norm_type_name(move_type)
     if not A:
         return 1.0
-    if not isinstance(tc, dict):  # unexpected structure
-        mat = _ATK_MAT_CACHE.get(id(tc))  # will be None
+    if not isinstance(type_chart, dict):  # unexpected structure
+        mat = _ATK_MAT_CACHE.get(id(type_chart))  # will be None
     # Retrieve / build cached matrix
-    mat = _ATK_MAT_CACHE.get(id(tc))
+    mat = _ATK_MAT_CACHE.get(id(type_chart))
     if mat is None:
         try:
-            mat = _tc_to_attack_matrix(tc if isinstance(tc, dict) else {})
+            mat = _tc_to_attack_matrix(type_chart if isinstance(type_chart, dict) else {})
         except Exception:
             mat = {T: {U: 1.0 for U in _CANON_TYPES} for T in _CANON_TYPES}
-        _ATK_MAT_CACHE[id(tc)] = mat
-    if not dfd_types:
+        _ATK_MAT_CACHE[id(type_chart)] = mat
+    if not defender_types:
         return 1.0
     eff = 1.0
-    for t in dfd_types:
+    for t in defender_types:
         D = _norm_type_name(t)
         if not D:
             continue
@@ -237,7 +239,7 @@ def _typing_bonus(candidate, opponent, mi: MovesInfo) -> float:
         if not t or t in seen_offense_types:
             continue
         seen_offense_types.add(t)
-        eff = _fixed_type_effectiveness(t, cand_types, tc)
+        eff = _fixed_type_effectiveness(move_type=t, defender_types=cand_types, type_chart=tc)
         if eff == 0:
             bonus += 0.2  # immunity => big bump
         elif eff < 1:

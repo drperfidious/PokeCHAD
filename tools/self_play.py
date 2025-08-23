@@ -70,27 +70,96 @@ def _simulate_offline(seed: int, w1: Dict[str,float], w2: Dict[str,float]) -> Ba
 async def _play_one(seed: int, format_id: str, w1: Dict[str, float], w2: Dict[str, float], max_turns: int = 300, *, offline: bool=False) -> BattleResult:
     if offline:
         return _simulate_offline(seed, w1, w2)
-    random.seed(seed)
-    try:
-        server_conf = ShowdownServerConfiguration  # type: ignore
-        p1 = StockfishPokeEnvPlayer(battle_format=format_id, server_configuration=server_conf)
-        p2 = StockfishPokeEnvPlayer(battle_format=format_id, server_configuration=server_conf)
-        p1.engine.set_weights(w1)
-        p2.engine.set_weights(w2)
-        battle = await p1.battle_against(p2, n_battles=1)
-        turns = getattr(battle, 'turn', 0) or 0
-        winner = None
-        p1_won = None
-        if getattr(battle, 'won', None) is True:
-            winner = 'p1'; p1_won = True
-        elif getattr(battle, 'won', None) is False:
-            winner = 'p2'; p1_won = False
-        else:
-            if getattr(battle, 'player_username', None) == getattr(battle, 'winner', None):
-                winner = 'p1'; p1_won = True
-        return BattleResult(seed=seed, winner=winner, p1_won=p1_won, n_turns=turns)
-    except Exception as e:
-        return BattleResult(seed=seed, winner=None, p1_won=None, n_turns=0, error=str(e))
+    
+    # Phase 2: Graceful degradation for network/battle errors with retry mechanism
+    max_retries = 3
+    base_delay = 1.0
+    
+    for attempt in range(max_retries):
+        try:
+            random.seed(seed + attempt)  # Slightly vary seed for retries
+            
+            # Add timeout for the entire battle operation
+            async def _battle_with_timeout():
+                server_conf = ShowdownServerConfiguration  # type: ignore
+                p1 = StockfishPokeEnvPlayer(battle_format=format_id, server_configuration=server_conf)
+                p2 = StockfishPokeEnvPlayer(battle_format=format_id, server_configuration=server_conf)
+                p1.engine.set_weights(w1)
+                p2.engine.set_weights(w2)
+                
+                battle = await p1.battle_against(p2, n_battles=1)
+                turns = getattr(battle, 'turn', 0) or 0
+                winner = None
+                p1_won = None
+                
+                if getattr(battle, 'won', None) is True:
+                    winner = 'p1'; p1_won = True
+                elif getattr(battle, 'won', None) is False:
+                    winner = 'p2'; p1_won = False
+                else:
+                    # Handle timeout/draw cases by checking battle winner field
+                    battle_winner = getattr(battle, 'winner', None)
+                    player_username = getattr(battle, 'player_username', None)
+                    
+                    if battle_winner and player_username:
+                        if battle_winner == player_username:
+                            winner = 'p1'; p1_won = True  # Timeout win for p1
+                        else:
+                            winner = 'p2'; p1_won = False  # Timeout win for p2
+                    else:
+                        # True draw/unclear result
+                        winner = None; p1_won = None
+                
+                return BattleResult(seed=seed, winner=winner, p1_won=p1_won, n_turns=turns)
+            
+            # Wait for battle with timeout (60 seconds per battle)
+            battle_result = await asyncio.wait_for(_battle_with_timeout(), timeout=60.0)
+            return battle_result
+            
+        except asyncio.TimeoutError:
+            error_msg = f"Battle timeout on attempt {attempt + 1}/{max_retries}"
+            if attempt < max_retries - 1:
+                # Wait before retry with exponential backoff
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+                continue
+            else:
+                # Final timeout, fall back to offline simulation
+                print(f"[Self-play] Network battle failed with timeout, falling back to offline simulation")
+                return _simulate_offline(seed, w1, w2)
+                
+        except (ConnectionError, OSError) as e:
+            error_msg = f"Network error on attempt {attempt + 1}/{max_retries}: {e}"
+            if attempt < max_retries - 1:
+                # Wait before retry with exponential backoff
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+                continue
+            else:
+                # Final network error, fall back to offline simulation
+                print(f"[Self-play] Network connection failed, falling back to offline simulation")
+                return _simulate_offline(seed, w1, w2)
+                
+        except Exception as e:
+            error_msg = f"Battle error on attempt {attempt + 1}/{max_retries}: {e}"
+            
+            # Check if this is a recoverable error
+            error_str = str(e).lower()
+            if any(term in error_str for term in ['connection', 'network', 'timeout', 'refused']):
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    # Network-related error, fall back to offline
+                    print(f"[Self-play] Network-related error, falling back to offline simulation: {e}")
+                    return _simulate_offline(seed, w1, w2)
+            else:
+                # Non-network error, return error result immediately
+                return BattleResult(seed=seed, winner=None, p1_won=None, n_turns=0, error=str(e))
+    
+    # This should never be reached, but just in case
+    return BattleResult(seed=seed, winner=None, p1_won=None, n_turns=0, error="Max retries exceeded")
 
 async def self_play_series(format_id: str, seeds: Iterable[int], w1: Dict[str, float], w2: Dict[str, float], *, offline: bool=False) -> List[BattleResult]:
     results: List[BattleResult] = []

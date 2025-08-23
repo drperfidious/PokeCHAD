@@ -10,6 +10,9 @@ from Data.battle_runtime import (
     predict_order_for_ids,
     estimate_damage,
     would_fail,
+    apply_switch_in_effects,  # NEW: hazards on switch-in
+    predict_first_prob_speed_only,  # NEW: speed-only fallback for first move probability
+    get_effective_speeds,  # NEW: effective speeds for scarf suspicion
 )
 from Data.poke_env_battle_environment import snapshot as snapshot_battle
 from Data.poke_env_moves_info import MovesInfo
@@ -17,7 +20,7 @@ from Data.poke_env_moves_info import MovesInfo
 # ---------------- Weights ----------------
 _DEFAULT_WEIGHTS: Dict[str, float] = {
     "expected_mult": 1.0,
-    "go_first_bonus": 0.3,  # slightly reduce overreliance on raw priority
+    "go_first_bonus": 0.4,
     "opp_dmg_penalty": 1.0,
     "survival_bonus": 0.0,
     "accuracy_mult": 0.0,
@@ -243,23 +246,6 @@ class StockfishModel:
                         if getattr(p,'species',None)==opp_active_species and (getattr(p,'current_hp',0)>0):
                             opp_key = k; break
             except Exception: pass
-        # NEW: if keys exist but species mismatch current battle view, remap to the correct slot
-        try:
-            cur_my_sp = getattr(getattr(battle,'active_pokemon',None),'species',None)
-            if my_key and cur_my_sp and getattr(state.team.ours.get(my_key),'species',None) != cur_my_sp:
-                for k,p in getattr(state.team,'ours',{}).items():
-                    if getattr(p,'species',None)==cur_my_sp and getattr(p,'current_hp',0)>0:
-                        my_key = k; break
-        except Exception:
-            pass
-        try:
-            cur_opp_sp = getattr(getattr(battle,'opponent_active_pokemon',None),'species',None) or getattr(getattr(battle,'opponent_active_pokemon',None),'base_species',None)
-            if opp_key and cur_opp_sp and getattr(state.team.opponent.get(opp_key),'species',None) != cur_opp_sp:
-                for k,p in getattr(state.team,'opponent',{}).items():
-                    if getattr(p,'species',None)==cur_opp_sp and getattr(p,'current_hp',0)>0:
-                        opp_key = k; break
-        except Exception:
-            pass
 
         opp_moves_known: List[str] = []
         if opp_key:
@@ -276,6 +262,13 @@ class StockfishModel:
             opp_ps = state.team.opponent[opp_key]
             opp_hp_frac = _hp_frac(opp_ps)
             opp_max = int(getattr(opp_ps,'max_hp',0) or getattr(opp_ps,'stats',{}).raw.get('hp',1) or 1)
+            # Precompute effective speeds for scarf suspicion
+            try:
+                my_eff_spe, opp_eff_spe = get_effective_speeds(state, my_key, opp_key)
+            except Exception:
+                my_eff_spe, opp_eff_spe = (0, 0)
+            opp_item_known = bool((getattr(opp_ps, 'item', None) or '').strip())
+            trick_room_active = bool(getattr(state.field, 'trick_room', False))
             for mv in legal_moves:
                 mid = getattr(mv,'id',None) or getattr(mv,'move_id',None)
                 if not mid: continue
@@ -288,23 +281,52 @@ class StockfishModel:
                 # expected damage
                 try: exp_frac, dmg = _expected_damage_fraction(state, my_key, opp_key, str(mid), mi)
                 except Exception: exp_frac, dmg = 0.0, {}
-                # move meta
+                # Retrieve move info to annotate category and potential boosts/debuffs
                 try:
-                    raw = mi.get(str(mid))
-                    cat = (raw.category or 'Status').lower()
-                    pri = int(raw.priority or getattr(mv,'priority',0) or 0)
-                    boosts = dict(raw.boosts or {})
+                    _minfo = mi.get(str(mid))
+                    _cat = (_minfo.category or 'Status').lower()
+                    _target = (_minfo.target or '').lower()
+                    _boosts = dict(_minfo.boosts or {})
                 except Exception:
-                    raw = None; cat = (getattr(mv,'category','') or 'Status').lower(); pri = int(getattr(mv,'priority',0) or 0); boosts = {}
+                    _cat, _target, _boosts = 'status', '', {}
+                # Extract self-boosts and opponent debuffs
+                _self_boosts = {}
+                _target_debuffs = {}
+                if _boosts:
+                    # If target is self (typical for Swords Dance/Nasty Plot), treat as self boosts
+                    if _target in {'self','selfside'} or _cat == 'status':
+                        for k,v in list(_boosts.items()):
+                            if isinstance(v, int) and v > 0 and k in ('atk','spa','def','spd','spe'):
+                                _self_boosts[k] = int(v)
+                            # negative boosts when target is self are rare; ignore for simplicity
+                    # If targeting opponent (normal/adjacentFoe), negative atk/spa are opponent debuffs
+                    if _target not in {'self','selfside'}:
+                        for k,v in list(_boosts.items()):
+                            if isinstance(v, int) and v < 0 and k in ('atk','spa'):
+                                _target_debuffs[k] = int(v)
                 acc_p = _acc_to_prob(getattr(mv,'accuracy',1.0))
-                eff = float((dmg.get('effectiveness',1.0) or 1.0))
-                # order (baseline)
+                eff = float(dmg.get('effectiveness',1.0) or 1.0)
+                # order
                 try:
-                    first_prob,details = predict_order_for_ids(state, my_key, str(mid), opp_key, (getattr(opp_ps.moves[0],'id',None) if getattr(opp_ps,'moves',None) else 'tackle'), mi)
-                    base_me_spe = float(details.get('user_effective_speed', 1.0) or 1.0)
-                    base_opp_spe = float(details.get('opp_effective_speed', 1.0) or 1.0)
+                    first_prob, order_details = predict_order_for_ids(
+                        state, my_key, str(mid), opp_key,
+                        (opp_moves_known[0] if opp_moves_known else 'tackle'), mi
+                    )
                 except Exception:
-                    first_prob = 0.5; base_me_spe = 1.0; base_opp_spe = 1.0
+                    # Fallback: speed-only compare
+                    try:
+                        first_prob = predict_first_prob_speed_only(state, my_key, opp_key)
+                    except Exception:
+                        first_prob = 0.5
+                first_prob = float(first_prob)
+                # Possible Scarf suspicion: if we only barely outspeed (opp * 1.5 > us), Trick Room off, opponent item unknown, and our move isn't priority
+                try:
+                    mv_base_pri = int(getattr(mv, 'priority', 0) or 0)
+                except Exception:
+                    mv_base_pri = 0
+                if (not trick_room_active) and (mv_base_pri <= 0) and (not opp_item_known) and (my_eff_spe > opp_eff_spe > 0) and ((opp_eff_spe * 3) > (my_eff_spe * 2)):
+                    # Cap our first probability to reflect scarf risk
+                    first_prob = min(first_prob, 0.30)
                 # KO chance if we hit
                 rolls = (dmg.get('rolls') or [])
                 thr_abs = int(round(opp_hp_frac * opp_max))
@@ -324,23 +346,46 @@ class StockfishModel:
                          + W['effectiveness_mult']*eff
                          + W['accuracy_mult']*acc_p
                          + W['ko_bonus']*p_ko_first)
-                # Breakdown
-                moves_eval.append({
+                # Breakdown for debug printing
+                c_expected = W['expected_mult']*effective_exp
+                c_opp = - W['opp_dmg_penalty']*opp_counter_ev
+                c_first = W['go_first_bonus']*first_prob
+                c_eff = W['effectiveness_mult']*eff
+                c_acc = W['accuracy_mult']*acc_p
+                c_ko = W['ko_bonus']*p_ko_first
+                cand_entry = {
                     'id':mid,'name':getattr(mv,'name',mid),'score':float(score),
                     'score_depth':float(score),'future_proj':0.0,'depth_used':1,
                     'expected':float(exp_frac),'exp_dmg':float(exp_frac),
-                    'acc':float(acc_p),'effectiveness':float(eff),'first_prob':float(first_prob),
+                    'acc':float(acc_p),'effectiveness':float(eff),'first_prob':first_prob,
                     'p_ko_if_hit':float(p_ko_if_hit),'p_ko_first':float(p_ko_first),
                     'opp_counter_ev':float(opp_counter_ev),'incoming_frac':float(incoming_best),
-                    # meta for boost-aware tree
-                    'priority': pri,
-                    'category': cat,
-                    'is_status': (cat=='status'),
-                    'boosts': boosts,
-                    'base_user_speed': base_me_spe,
-                    'base_opp_speed': base_opp_spe,
-                    'score_breakdown': {}
-                })
+                    'category': _cat,
+                    'self_boosts': _self_boosts or {},
+                    'target_debuffs': _target_debuffs or {},
+                    'score_breakdown': {
+                        'expected': c_expected,
+                        'opp_dmg_penalty': c_opp,
+                        'go_first_bonus': c_first,
+                        'effectiveness_mult': c_eff,
+                        'accuracy_mult': c_acc,
+                        'ko_bonus': c_ko,
+                    }
+                }
+                # Attach order details if available
+                try:
+                    if 'order_details' not in cand_entry and 'order_details' in locals():
+                        od = order_details or {}
+                        cand_entry['order_details'] = {
+                            'user_effective_speed': od.get('user_effective_speed'),
+                            'opp_effective_speed': od.get('opp_effective_speed'),
+                            'user_bracket': od.get('user_bracket'),
+                            'opp_bracket': od.get('opp_bracket'),
+                            'notes': od.get('notes'),
+                        }
+                except Exception:
+                    pass
+                moves_eval.append(cand_entry)
             moves_eval.sort(key=lambda x: x.get('score_depth', x.get('score',0.0)), reverse=True)
 
             # Build switch evaluations EARLY (needed for tree search) if not already built
@@ -360,8 +405,17 @@ class StockfishModel:
                                 cand_key=k; break
                         if not cand_key: continue
                         cand_hp = _hp_frac(state.team.ours[cand_key])
+                        # Hazards on switch-in (ally side switches into opponent hazards)
+                        haz_frac = 0.0
+                        try:
+                            haz = apply_switch_in_effects(state, cand_key, 'ally', mi, mutate=False)
+                            haz_frac = float(haz.get('fraction_lost', 0.0) or 0.0)
+                        except Exception:
+                            haz_frac = 0.0
                         try: incoming = _opp_best_on_target(state, opp_key, cand_key, mi)
                         except Exception: incoming=0.0
+                        # Total incoming this turn includes entry hazards + opponent counter damage
+                        incoming_total = float(haz_frac) + float(incoming)
                         outgoing=0.0
                         try:
                             for mv_obj in getattr(state.team.ours[cand_key],'moves',[]) or []:
@@ -373,14 +427,14 @@ class StockfishModel:
                                 outgoing = max(outgoing, frac2*_acc_to_prob(getattr(mv_obj,'accuracy',None)))
                         except Exception: pass
                         W=self._W
-                        score = W['switch_outgoing_mult']*outgoing - W['switch_incoming_penalty']*incoming
+                        score = W['switch_outgoing_mult']*outgoing - W['switch_incoming_penalty']*incoming_total
                         switches_eval.append({
                             'species':species,'score':float(score),'base_score':float(score),
-                            'outgoing_frac':float(outgoing),'incoming_on_switch':float(incoming),
-                            'hazards_frac':0.0,'hp_fraction':float(cand_hp),
+                            'outgoing_frac':float(outgoing),'incoming_on_switch':float(incoming_total),
+                            'hazards_frac':float(haz_frac),'hp_fraction':float(cand_hp),
                             'score_breakdown': {
                                 'switch_outgoing_mult': W['switch_outgoing_mult']*outgoing,
-                                'switch_incoming_penalty': - W['switch_incoming_penalty']*incoming,
+                                'switch_incoming_penalty': - W['switch_incoming_penalty']*incoming_total,
                             }
                         })
                     except Exception: continue
@@ -397,28 +451,22 @@ class StockfishModel:
                             mid = getattr(mv,'id',None)
                             if not mid: continue
                             if (getattr(mv,'category','') or '').lower()=='status' or (getattr(mv,'base_power',0) or getattr(mv,'basePower',0) or 0) <= 0:
-                                # still keep notable boost moves to model priority comparisons minimally
-                                try:
-                                    raw = mi.get(str(mid)); pri = int(raw.priority or 0); cat = (raw.category or 'Status').lower()
-                                except Exception:
-                                    pri = int(getattr(mv,'priority',0) or 0); cat = (getattr(mv,'category','') or 'status').lower()
-                                opp_moves_full.append({'id': mid, 'name': getattr(mv,'name',mid), 'exp': 0.0, 'acc': 1.0, 'priority': pri, 'category': cat})
                                 continue
+                            try: exp_frac_o, dmg_o = _expected_damage_fraction(state, opp_key, my_key, mid, mi)
+                            except Exception: exp_frac_o, dmg_o = 0.0, {}
+                            # Lookup opponent move category for future defensive scaling
                             try:
-                                exp_frac_o, dmg_o = _expected_damage_fraction(state, opp_key, my_key, mid, mi)
+                                _ominf = mi.get(str(mid))
+                                _ocat = (_ominf.category or 'Physical').lower()
                             except Exception:
-                                exp_frac_o, dmg_o = 0.0, {}
-                            try:
-                                raw = mi.get(str(mid)); pri = int(raw.priority or 0); cat = (raw.category or 'Status').lower()
-                            except Exception:
-                                pri = int(getattr(mv,'priority',0) or 0); cat = (getattr(mv,'category','') or 'status').lower()
-                            opp_moves_full.append({'id': mid, 'name': getattr(mv,'name',mid), 'exp': exp_frac_o, 'acc': _acc_to_prob(getattr(mv,'accuracy',1.0)), 'priority': pri, 'category': cat})
+                                _ocat = 'physical'
+                            opp_moves_full.append({'id': mid, 'name': getattr(mv,'name',mid), 'exp': exp_frac_o, 'acc': _acc_to_prob(getattr(mv,'accuracy',1.0)), 'category': _ocat})
                 except Exception:
                     pass
                 if not opp_moves_full:
                     try: base_in = _opp_best_on_target(state, opp_key, my_key, mi)
                     except Exception: base_in = 0.0
-                    opp_moves_full = [{'id':'_synthetic','name':'(opp_best)','exp': base_in, 'acc':1.0, 'priority': 0, 'category': 'physical'}]
+                    opp_moves_full = [{'id':'_synthetic','name':'(opp_best)','exp': base_in, 'acc':1.0, 'category': 'physical'}]
                 opp_moves = opp_moves_full[:self._branching]
 
                 # Baseline HP fractions
@@ -429,7 +477,7 @@ class StockfishModel:
 
                 W = self._W
 
-                # Build our action list
+                # Build our action list (top branching moves + top branching switches)
                 my_actions: List[Dict[str, Any]] = []
                 for mv in moves_eval[:self._branching]:
                     my_actions.append({'kind':'move','ref':mv})
@@ -440,13 +488,8 @@ class StockfishModel:
                 # Collect alive opponent keys (active + bench)
                 opp_alive_keys: List[str] = []
                 try:
-                    seen_species = set()
                     for k,ps in state.team.opponent.items():
                         if getattr(ps,'current_hp',0) > 0 and (getattr(ps,'status','') or '').lower()!='fnt':
-                            sp = (getattr(ps,'species','') or '').lower()
-                            if sp and sp in seen_species:
-                                continue
-                            seen_species.add(sp)
                             opp_alive_keys.append(k)
                 except Exception:
                     opp_alive_keys = [opp_key] if opp_key else []
@@ -455,13 +498,8 @@ class StockfishModel:
                 # Collect our alive keys
                 my_alive_keys: List[str] = []
                 try:
-                    seen_my_species = set()
                     for k,ps in state.team.ours.items():
                         if getattr(ps,'current_hp',0) > 0 and (getattr(ps,'status','') or '').lower()!='fnt':
-                            sp = (getattr(ps,'species','') or '').lower()
-                            if sp and sp in seen_my_species:
-                                continue
-                            seen_my_species.add(sp)
                             my_alive_keys.append(k)
                 except Exception:
                     my_alive_keys = [my_key] if my_key else []
@@ -517,139 +555,171 @@ class StockfishModel:
                 # Dynamic recursion with active keys and HP remaining
                 from functools import lru_cache
 
+                def _stage_mult(delta: int) -> float:
+                    try:
+                        n = int(delta)
+                    except Exception:
+                        return 1.0
+                    if n >= 0:
+                        return (2 + n) / 2
+                    else:
+                        # e.g., n=-1 => 2/(2-(-1)) = 2/3
+                        return 2 / (2 - n)
+
                 @lru_cache(maxsize=8192)
                 def recurse(active_my: str, active_opp: str, my_rem: float, opp_rem: float, turns_left: int,
-                            my_atk: int=0, my_def: int=0, my_spa: int=0, my_spd: int=0, my_spe: int=0,
-                            opp_atk: int=0, opp_def: int=0, opp_spa: int=0, opp_spd: int=0, opp_spe: int=0) -> float:
+                            my_phys_scale: float=1.0, my_spec_scale: float=1.0,
+                            opp_phys_scale: float=1.0, opp_spec_scale: float=1.0) -> float:
                     if turns_left <= 0 or my_rem <= 0 or opp_rem <= 0:
                         if tree_trace_enabled:
                             tree_trace.append(f"[TREE][BASE] tl={turns_left} my={my_rem:.3f} opp={opp_rem:.3f} act_my={active_my} act_opp={active_opp} -> 0.000")
                         return 0.0
                     best_val = None
-                    # Assemble actions (moves + switches)
+                    # Rebuild candidate action lists each depth (filter out switches to already-active)
                     current_actions: List[Dict[str, Any]] = []
-                    move_count = 0; switch_count = 0
+                    # Reuse precomputed stats but adjust for active key changes (switching changes active_my reference for opp damage lookups later)
+                    move_count = 0
+                    switch_count = 0
                     for act in my_actions:
                         if act['kind']=='move':
                             if move_count < branching_cap:
-                                current_actions.append(act); move_count += 1
+                                current_actions.append(act)
+                                move_count += 1
                         else:
+                            # skip switching to same active
+                            species = act['ref'].get('species')
+                            # Identify key of that species
                             if switch_count < branching_cap:
-                                current_actions.append(act); switch_count += 1
-                    # Opponent replies
+                                current_actions.append(act)
+                                switch_count += 1
+                    # Opponent replies: damaging moves + switch-ins
                     opp_reply_moves = opp_moves_full[:branching_cap]
                     opp_reply_switches = opp_switch_candidates[:branching_cap]
 
                     for act in current_actions:
                         kind = act['kind']; ref = act['ref']
-                        # Determine our expected damage vs current opponent using per-target exp map + stage multipliers
+                        # Determine our expected damage vs current opponent (if move) using per-target exp map
                         exp_map = ref.get('exp_by_target') or {}
-                        base_exp_vs_current = float(exp_map.get(active_opp, 0.0)) if kind=='move' else 0.0
-                        cat = (ref.get('category') or 'status').lower() if kind=='move' else 'status'
-                        pri_user = int(ref.get('priority',0)) if kind=='move' else 0
-                        # Adjust by stages
-                        if cat == 'physical':
-                            our_exp_vs_current = base_exp_vs_current * (_stage_mult(my_atk) / max(1e-6,_stage_mult(opp_def)))
-                        elif cat == 'special':
-                            our_exp_vs_current = base_exp_vs_current * (_stage_mult(my_spa) / max(1e-6,_stage_mult(opp_spd)))
-                        else:
-                            our_exp_vs_current = 0.0  # status deals no direct damage
-                        # First prob heuristic (priority-aware; speed boost nudges)
+                        # Apply our current offense scaling by move category
+                        mv_cat = str(ref.get('category','status')).lower()
+                        scale_now = 1.0
+                        if mv_cat == 'physical':
+                            scale_now = float(my_phys_scale)
+                        elif mv_cat == 'special':
+                            scale_now = float(my_spec_scale)
+                        our_exp_vs_current = (float(exp_map.get(active_opp, 0.0)) * scale_now) if kind=='move' else 0.0
                         first_prob = float(ref.get('first_prob',0.5)) if kind=='move' else 0.0
                         if tree_trace_enabled:
                             ident = ref.get('id') if kind=='move' else ref.get('species')
-                            tree_trace.append(f"[TREE][ACT] tl={turns_left} my={my_rem:.3f} opp={opp_rem:.3f} kind={kind} ident={ident} our_exp={our_exp_vs_current:.3f} first={first_prob:.3f}")
+                            tree_trace.append(f"[TREE][ACT] tl={turns_left} my={my_rem:.3f} opp={opp_rem:.3f} kind={kind} ident={ident} our_exp={our_exp_vs_current:.3f} first={first_prob:.3f} scaleP={my_phys_scale:.2f} scaleS={my_spec_scale:.2f}")
                         reply_vals: List[float] = []
                         # 1. Opponent move replies
                         for o in opp_reply_moves:
                             opp_exp_map = o.get('exp_by_target_my') or {}
-                            opp_base = float(opp_exp_map.get(active_my, 0.0))
-                            cat_o = (o.get('category') or 'physical').lower()
-                            pri_opp = int(o.get('priority',0) or 0)
-                            # If equal priority, speed order may flip with boosts; apply a simple nudge
-                            # If our priority outranks, we go first; if theirs outranks, we go second
-                            fp = first_prob
-                            if kind=='move':
-                                if pri_user > pri_opp:
-                                    fp = 1.0
-                                elif pri_user < pri_opp:
-                                    fp = 0.0
-                                else:
-                                    # use base speeds seen on this move if present, scaled by our/my_spe boosts
-                                    me_base = float(ref.get('base_user_speed', 1.0) or 1.0)
-                                    op_base = float(ref.get('base_opp_speed', 1.0) or 1.0)
-                                    me_eff = me_base * _stage_mult(my_spe)
-                                    op_eff = op_base * _stage_mult(opp_spe)
-                                    fp = 1.0 if me_eff > op_eff else 0.0
-                            # Incoming adjustment by our defensive boosts (apply if we act first and the move is executed after our boost this turn)
-                            if cat_o == 'physical':
-                                opp_effective_hit = opp_base / max(1e-6,_stage_mult(my_def if fp>=0.999 and kind=='move' and ref.get('is_status') and ref.get('boosts') else my_def))
-                            elif cat_o == 'special':
-                                opp_effective_hit = opp_base / max(1e-6,_stage_mult(my_spd if fp>=0.999 and kind=='move' and ref.get('is_status') and ref.get('boosts') else my_spd))
-                            else:
-                                opp_effective_hit = 0.0
+                            opp_exp_base = float(opp_exp_map.get(active_my, 0.0))
+                            # Adjust by our defensive/debuff scaling based on opponent move category
+                            ocat = str(o.get('category','physical')).lower()
+                            opp_scale_now = float(opp_phys_scale if ocat=='physical' else opp_spec_scale)
+                            opp_exp_scaled = opp_exp_base * opp_scale_now
+                            # If we switched this turn, opponent move hits new active later (we take full damage); if we moved, speed determines
                             if kind=='move':
                                 # KO check vs current active opponent
                                 ko_if_hit = our_exp_vs_current >= opp_rem - 1e-9
-                                opp_effective = opp_effective_hit * ((1-fp) + (fp * (0 if ko_if_hit and our_exp_vs_current>0 else 1)))
+                                opp_effective = opp_exp_scaled * ((1-first_prob) + (first_prob * (0 if ko_if_hit else 1)))
                                 our_effective = our_exp_vs_current
-                                inc = (W['expected_mult']*our_effective - W['opp_dmg_penalty']*opp_effective + W['go_first_bonus']*fp)
-                                if ko_if_hit and our_effective>0:
+                                inc = (W['expected_mult']*our_effective - W['opp_dmg_penalty']*opp_effective + W['go_first_bonus']*first_prob)
+                                if ko_if_hit:
                                     inc += W['ko_bonus']
                                 next_my = max(0.0, my_rem - opp_effective)
                                 next_opp = max(0.0, opp_rem - our_effective)
-                                # Apply stage deltas if this move boosts (after execution)
-                                b = ref.get('boosts') or {}
-                                n_my_atk = my_atk + int(b.get('atk',0))
-                                n_my_def = my_def + int(b.get('def',0))
-                                n_my_spa = my_spa + int(b.get('spa',0))
-                                n_my_spd = my_spd + int(b.get('spd',0))
-                                n_my_spe = my_spe + int(b.get('spe',0))
+                                # Update scales if this move is a self-boost or debuffing move
+                                next_my_phys_scale = my_phys_scale
+                                next_my_spec_scale = my_spec_scale
+                                next_opp_phys_scale = opp_phys_scale
+                                next_opp_spec_scale = opp_spec_scale
+                                if mv_cat == 'status':
+                                    sb = ref.get('self_boosts') or {}
+                                    if 'atk' in sb:
+                                        next_my_phys_scale *= _stage_mult(int(sb['atk']))
+                                    if 'spa' in sb:
+                                        next_my_spec_scale *= _stage_mult(int(sb['spa']))
+                                    if 'def' in sb:
+                                        # Increasing our Defense reduces incoming physical damage => divide opponent physical scale by this factor
+                                        next_opp_phys_scale /= _stage_mult(int(sb['def']))
+                                    if 'spd' in sb:
+                                        next_opp_spec_scale /= _stage_mult(int(sb['spd']))
+                                    # Opponent offensive debuffs from our status move
+                                    tdb = ref.get('target_debuffs') or {}
+                                    if 'atk' in tdb:
+                                        next_opp_phys_scale *= _stage_mult(int(tdb['atk']))
+                                    if 'spa' in tdb:
+                                        next_opp_spec_scale *= _stage_mult(int(tdb['spa']))
                                 future = recurse(active_my, active_opp, next_my, next_opp, turns_left - 1,
-                                                 n_my_atk, n_my_def, n_my_spa, n_my_spd, n_my_spe,
-                                                 opp_atk, opp_def, opp_spa, opp_spd, opp_spe) if next_my>0 and next_opp>0 else 0.0
-                            else:
-                                opp_effective = opp_effective_hit
+                                                 next_my_phys_scale, next_my_spec_scale,
+                                                 next_opp_phys_scale, next_opp_spec_scale) if next_my>0 and next_opp>0 else 0.0
+                            else:  # we switched => no damage dealt, incoming based on opponent move vs NEW active (we need to know which we switched to)
+                                # Approximation: use current active_my still (we are not modeling identity change)
+                                opp_effective = opp_exp_scaled
                                 inc = - W['opp_dmg_penalty']*opp_effective
                                 our_effective = 0.0
                                 next_my = max(0.0, my_rem - opp_effective)
                                 next_opp = opp_rem
+                                # Switching clears our previous boosts/debuffs context
                                 future = recurse(active_my, active_opp, next_my, next_opp, turns_left - 1,
-                                                 my_atk, my_def, my_spa, my_spd, my_spe,
-                                                 opp_atk, opp_def, opp_spa, opp_spd, opp_spe) if next_my>0 else 0.0
+                                                 1.0, 1.0, opp_phys_scale, opp_spec_scale) if next_my>0 else 0.0
                             total = inc + future
                             reply_vals.append(total)
                             if tree_trace_enabled:
-                                tree_trace.append(f"[TREE][RPLY] tl={turns_left} act_kind={kind} opp_mv={o['id']} opp_exp={opp_base:.3f} opp_eff={(opp_effective if kind=='move' else opp_effective):.3f} inc={inc:.3f} future={future:.3f} total={total:.3f} next_my={next_my:.3f} next_opp={next_opp:.3f}")
-                        # 2. Opponent switch replies (unchanged except stage carry)
+                                tree_trace.append(f"[TREE][RPLY] tl={turns_left} act_kind={kind} opp_mv={o['id']} opp_exp={opp_exp_base:.3f} opp_eff={(opp_effective if kind=='move' else opp_exp_scaled):.3f} inc={inc:.3f} future={future:.3f} total={total:.3f} next_my={next_my:.3f} next_opp={next_opp:.3f}")
+                        # 2. Opponent switch replies
                         for sw in opp_reply_switches:
                             to_key = sw['to_key']; to_hp_full = float(sw['hp_frac'])
                             if kind=='move':
+                                # Our move will hit the new Pokemon after switch (switch happens first). Use damage vs that target.
                                 our_exp_vs_new = float(exp_map.get(to_key, 0.0))
-                                if cat == 'physical':
-                                    our_exp_vs_new *= _stage_mult(my_atk)
-                                elif cat == 'special':
-                                    our_exp_vs_new *= _stage_mult(my_spa)
-                                inc = W['expected_mult']*our_exp_vs_new + W['go_first_bonus']*first_prob
+                                # Apply our offense scaling by this move's category
+                                our_exp_vs_new *= scale_now
+                                # No damage taken from opponent this turn
+                                inc = W['expected_mult']*our_exp_vs_new + W['go_first_bonus']*first_prob  # we still get go-first bonus heuristic
                                 ko_if_hit_new = our_exp_vs_new >= to_hp_full - 1e-9
-                                if ko_if_hit_new and our_exp_vs_new>0:
+                                if ko_if_hit_new:
                                     inc += W['ko_bonus']
                                 next_my = my_rem
                                 next_opp = max(0.0, to_hp_full - our_exp_vs_new)
-                                b = ref.get('boosts') or {}
-                                n_my_atk = my_atk + int(b.get('atk',0)); n_my_def = my_def + int(b.get('def',0))
-                                n_my_spa = my_spa + int(b.get('spa',0)); n_my_spd = my_spd + int(b.get('spd',0))
-                                n_my_spe = my_spe + int(b.get('spe',0))
+                                # Update scales for future if this was a boosting/debuffing status move
+                                next_my_phys_scale = my_phys_scale
+                                next_my_spec_scale = my_spec_scale
+                                # On opponent switch, reset their debuffs but keep our own Def/SpD boosts as incoming reduction
+                                new_opp_phys_scale = 1.0
+                                new_opp_spec_scale = 1.0
+                                if mv_cat == 'status':
+                                    sb = ref.get('self_boosts') or {}
+                                    if 'atk' in sb:
+                                        next_my_phys_scale *= _stage_mult(int(sb['atk']))
+                                    if 'spa' in sb:
+                                        next_my_spec_scale *= _stage_mult(int(sb['spa']))
+                                    if 'def' in sb:
+                                        new_opp_phys_scale /= _stage_mult(int(sb['def']))
+                                    if 'spd' in sb:
+                                        new_opp_spec_scale /= _stage_mult(int(sb['spd']))
+                                    # Opponent offensive debuffs do not persist through their switch -> intentionally ignored
+                                else:
+                                    # No new boost this turn; keep any existing incoming reduction from our prior Def/SpD scales
+                                    # Approximation: propagate current incoming reduction if it came from our Def/SpD boosts
+                                    # We cannot disentangle prior debuffs here, so reset to neutral
+                                    new_opp_phys_scale = 1.0
+                                    new_opp_spec_scale = 1.0
                                 future = recurse(active_my, to_key, next_my, next_opp, turns_left - 1,
-                                                 n_my_atk, n_my_def, n_my_spa, n_my_spd, n_my_spe,
-                                                 opp_atk, opp_def, opp_spa, opp_spd, opp_spe) if next_opp>0 else 0.0
+                                                 next_my_phys_scale, next_my_spec_scale,
+                                                 new_opp_phys_scale, new_opp_spec_scale) if next_opp>0 else 0.0
                             else:
+                                # Double switch: no damage this turn
                                 inc = 0.0
                                 next_my = my_rem
                                 next_opp = to_hp_full
+                                # Our switch resets our own boost context; opponent switching resets theirs as well
                                 future = recurse(active_my, to_key, next_my, next_opp, turns_left - 1,
-                                                 my_atk, my_def, my_spa, my_spd, my_spe,
-                                                 opp_atk, opp_def, opp_spa, opp_spd, opp_spe)
+                                                 1.0, 1.0, 1.0, 1.0)
                             total = inc + future
                             reply_vals.append(total)
                             if tree_trace_enabled:
@@ -680,7 +750,7 @@ class StockfishModel:
                 for act in my_actions:
                     ref = act['ref']
                     base_score = float(ref.get('score',0.0))
-                    val = recurse(my_key, opp_key, my_hp_now, opp_hp_now, turns_left)
+                    val = recurse(my_key, opp_key, my_hp_now, opp_hp_now, turns_left, 1.0, 1.0, 1.0, 1.0)
                     if val is not None:
                         ref['score_depth'] = val
                         ref['future_proj'] = val - base_score
@@ -691,7 +761,7 @@ class StockfishModel:
                             ref.setdefault('softmin_temp', self._softmin_temp)
                         if act['kind']=='move':
                             ref.setdefault('tree_includes_switches', True)
-                # Resort
+                # Resort after depth
                 moves_eval.sort(key=lambda x: x.get('score_depth', x.get('score',0.0)), reverse=True)
                 switches_eval.sort(key=lambda x: x.get('score_depth', x.get('score', x.get('base_score',0.0))), reverse=True)
 
@@ -711,7 +781,9 @@ class StockfishModel:
                 bp = int(raw.base_power or 0)
                 acc = _acc_to_prob(raw.accuracy)
                 mv_type = (raw.type or '').lower()
-                stab = 1.5 if (mv_type in my_types and mv_type) and cat in {'physical','special'} else 1.0
+                # Normalize my_types for membership safely
+                my_types_lc = {str(t).lower() for t in my_types if t}
+                stab = 1.5 if (mv_type and (mv_type in my_types_lc) and cat in {'physical','special'}) else 1.0
                 # status moves score low; damaging moves scale with power, STAB and accuracy (normalized)
                 base = 0.0
                 if cat in {'physical','special'} and bp > 0:
@@ -735,6 +807,52 @@ class StockfishModel:
             # When we don't know the opponent, avoid considering switches (prevents pointless cycling)
             switches_eval = []
 
+        # If my_key is still None but we have legal moves, build an ultra-safe fallback using active_pokemon types
+        elif not force_switch and (not my_key) and legal_moves:
+            skip_reason = 'my_key=None'
+            # Try to infer our types from active_pokemon
+            my_types_lc = set()
+            try:
+                ap = getattr(battle, 'active_pokemon', None)
+                if ap is not None:
+                    for t in (getattr(ap,'types',[]) or []):
+                        if not t: continue
+                        try:
+                            my_types_lc.add(str(t).lower())
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            for mv in legal_moves:
+                mid = getattr(mv,'id',None) or getattr(mv,'move_id',None)
+                if not mid: continue
+                raw = mi.get(str(mid))
+                cat = (raw.category or 'Status').lower()
+                bp = int(raw.base_power or 0)
+                acc = _acc_to_prob(raw.accuracy)
+                mv_type = (raw.type or '').lower()
+                stab = 1.5 if (mv_type and (mv_type in my_types_lc) and cat in {'physical','special'}) else 1.0
+                base = 0.0
+                if cat in {'physical','special'} and bp > 0:
+                    base = (bp/100.0) * stab * acc
+                moves_eval.append({
+                    'id': str(mid), 'name': getattr(mv,'name', mid),
+                    'score': float(base), 'score_depth': float(base), 'future_proj': 0.0, 'depth_used': 1,
+                    'expected': 0.0, 'exp_dmg': 0.0, 'acc': float(acc), 'effectiveness': 1.0,
+                    'first_prob': 0.5, 'p_ko_if_hit': 0.0, 'p_ko_first': 0.0,
+                    'opp_counter_ev': 0.0, 'incoming_frac': 0.0,
+                    'score_breakdown': {
+                        'expected': base,
+                        'opp_dmg_penalty': 0.0,
+                        'go_first_bonus': 0.0,
+                        'effectiveness_mult': 0.0,
+                        'accuracy_mult': 0.0,
+                        'ko_bonus': 0.0,
+                    }
+                })
+            moves_eval.sort(key=lambda x: x.get('score_depth', x.get('score',0.0)), reverse=True)
+            switches_eval = []
+
         # If we are in a force switch situation (or move eval skipped) we may still need switch evaluations
         if not switches_eval and legal_switches:
             try:
@@ -753,11 +871,19 @@ class StockfishModel:
                     if not cand_key:
                         continue
                     cand_hp = _hp_frac(state.team.ours[cand_key])
+                    # Hazards on switch-in
+                    haz_frac = 0.0
+                    try:
+                        haz = apply_switch_in_effects(state, cand_key, 'ally', mi, mutate=False)
+                        haz_frac = float(haz.get('fraction_lost', 0.0) or 0.0)
+                    except Exception:
+                        haz_frac = 0.0
                     # Incoming damage expectation (if opponent active known)
                     try:
                         incoming = _opp_best_on_target(state, opp_key, cand_key, mi) if opp_key else 0.0
                     except Exception:
                         incoming = 0.0
+                    incoming_total = float(haz_frac) + float(incoming)
                     outgoing = 0.0
                     if opp_key:
                         try:
@@ -771,14 +897,14 @@ class StockfishModel:
                         except Exception:
                             pass
                     W=self._W
-                    score = W['switch_outgoing_mult']*outgoing - W['switch_incoming_penalty']*incoming
+                    score = W['switch_outgoing_mult']*outgoing - W['switch_incoming_penalty']*incoming_total
                     switches_eval.append({
                         'species':species,'score':float(score),'base_score':float(score),
-                        'outgoing_frac':float(outgoing),'incoming_on_switch':float(incoming),
-                        'hazards_frac':0.0,'hp_fraction':float(cand_hp),
+                        'outgoing_frac':float(outgoing),'incoming_on_switch':float(incoming_total),
+                        'hazards_frac':float(haz_frac),'hp_fraction':float(cand_hp),
                         'score_breakdown': {
                             'switch_outgoing_mult': W['switch_outgoing_mult']*outgoing,
-                            'switch_incoming_penalty': - W['switch_incoming_penalty']*incoming,
+                            'switch_incoming_penalty': - W['switch_incoming_penalty']*incoming_total,
                         }
                     })
                 switches_eval.sort(key=lambda x: x.get('score',0.0), reverse=True)
@@ -820,11 +946,14 @@ class StockfishModel:
                     best_move.setdefault('heuristics',{})['lethal_risk_penalty'] = lethal_risk
                     moves_eval.sort(key=lambda x: x.get('score_depth', x.get('score',0.0)), reverse=True)
                     best_move = moves_eval[0]
-            # prefer survivable switch
-            if can_switch and best_switch and first_prob < 0.5:
-                if best_switch.get('incoming_on_switch',1.0) < (active_hp_frac or 1.0):
-                    best_switch['score'] = max(best_switch['score'], (best_move.get('score_depth', best_move.get('score',0.0)) or 0.0)+0.01)
-                    best_switch.setdefault('heuristics',{})['lethal_switch_preference']=True
+            # Conservative extra: low HP and likely to be chunked hard even if not full lethal -> prefer survivable switch when we likely don't go first
+            if can_switch and best_switch and (first_prob <= 0.3 or lethal_risk >= 0.5):
+                low_hp = (active_hp_frac <= 0.4)
+                heavy_chunk = (predicted_incoming_frac or 0.0) >= 0.8 * (active_hp_frac or 1.0)
+                if low_hp and (heavy_chunk or lethal_risk >= 0.6):
+                    if best_switch.get('incoming_on_switch',1.0) < (active_hp_frac or 1.0):
+                        best_switch['score'] = max(best_switch['score'], (best_move.get('score_depth', best_move.get('score',0.0)) or 0.0)+0.01)
+                        best_switch.setdefault('heuristics',{})['low_hp_survival_preference']=True
         # last mon aggression
         if our_remaining <= 1 and moves_eval:
             moves_eval.sort(key=lambda x: (x.get('expected',0.0)*x.get('acc',1.0)), reverse=True)
@@ -856,20 +985,97 @@ class StockfishModel:
             best_move = None  # type: ignore
         if 'best_switch' not in locals():
             best_switch = None  # type: ignore
+        
+        # Phase 1: Switch validation before execution
+        def _validate_switch(switch_species: str) -> bool:
+            """Validate that a switch is legal before execution."""
+            try:
+                if not switch_species:
+                    return False
+                
+                # Check if we have any legal switches
+                if not legal_switches:
+                    return False
+                
+                # Check if target species is in available switches
+                for sw in legal_switches:
+                    if str(getattr(sw, 'species', '')).lower() == str(switch_species).lower():
+                        # Additional validation: check if Pokemon is alive
+                        if my_key and state and hasattr(state, 'team'):
+                            for k, ps in state.team.ours.items():
+                                if str(getattr(ps, 'species', '')).lower() == str(switch_species).lower():
+                                    current_hp = getattr(ps, 'current_hp', 0)
+                                    status = (getattr(ps, 'status', '') or '').lower()
+                                    if current_hp > 0 and status != 'fnt':
+                                        return True
+                        else:
+                            # Fallback: if we can't check team state, trust legal_switches
+                            return True
+                
+                return False
+            except Exception:
+                # On validation error, be conservative and reject
+                return False
+        
         if force_switch and best_switch:
-            dbg = _debug_base(); dbg['picked']={'kind':'switch', **best_switch}
-            decision = ChosenAction(kind='switch', switch_species=best_switch['species'], debug=dbg)
+            # Validate switch before execution
+            if _validate_switch(best_switch['species']):
+                dbg = _debug_base(); dbg['picked']={'kind':'switch', **best_switch}
+                decision = ChosenAction(kind='switch', switch_species=best_switch['species'], debug=dbg)
+            else:
+                # Switch validation failed, fallback to first legal switch
+                dbg = _debug_base(); dbg['fallback']=True; dbg['switch_validation_failed']=True
+                if legal_switches:
+                    fallback_species = str(getattr(legal_switches[0], 'species', ''))
+                    decision = ChosenAction(kind='switch', switch_species=fallback_species, debug=dbg)
+                else:
+                    decision = ChosenAction(kind='move', move_id='struggle', debug=dbg)
         else:
             # Choose move vs switch (margin)
             MARGIN = 0.05
             if best_move and (not best_switch or best_move.get('score_depth', best_move.get('score',0.0)) >= best_switch.get('score',0.0)+MARGIN):
                 dbg = _debug_base();
                 dbg['picked']={'kind':'move', **best_move};
-                dbg['order']={'p_user_first': float(best_move.get('first_prob',0.5))}
+                # Enrich order + speed meta for UI/telemetry
+                order_info = {
+                    'p_user_first': float(best_move.get('first_prob', 0.5))
+                }
+                try:
+                    od = best_move.get('order_details') or {}
+                    if od:
+                        order_info.update({
+                            'user_bracket': od.get('user_bracket'),
+                            'opp_bracket': od.get('opp_bracket'),
+                            'notes': od.get('notes'),
+                        })
+                except Exception:
+                    pass
+                dbg['order'] = order_info
+                try:
+                    dbg['speed_meta'] = {
+                        'my_effective_speed': int(my_eff_spe),
+                        'opp_effective_speed': int(opp_eff_spe),
+                        'trick_room': bool(trick_room_active),
+                    }
+                except Exception:
+                    pass
                 decision = ChosenAction(kind='move', move_id=str(best_move['id']), debug=dbg)
             elif best_switch:
-                dbg = _debug_base(); dbg['picked']={'kind':'switch', **best_switch}
-                decision = ChosenAction(kind='switch', switch_species=best_switch['species'], debug=dbg)
+                # Validate optional switch before execution
+                if _validate_switch(best_switch['species']):
+                    dbg = _debug_base(); dbg['picked']={'kind':'switch', **best_switch}
+                    decision = ChosenAction(kind='switch', switch_species=best_switch['species'], debug=dbg)
+                else:
+                    # Switch validation failed, fallback to best move or first legal action
+                    if best_move:
+                        dbg = _debug_base(); dbg['picked']={'kind':'move', **best_move}; dbg['switch_validation_failed']=True
+                        decision = ChosenAction(kind='move', move_id=str(best_move['id']), debug=dbg)
+                    elif legal_moves:
+                        dbg = _debug_base(); dbg['fallback']=True; dbg['switch_validation_failed']=True
+                        decision = ChosenAction(kind='move', move_id=str(getattr(legal_moves[0],'id','')), debug=dbg)
+                    else:
+                        dbg = _debug_base(); dbg['fallback']=True; dbg['switch_validation_failed']=True
+                        decision = ChosenAction(kind='move', move_id='struggle', debug=dbg)
             else:
                 # Fallbacks
                 if legal_moves:
@@ -990,18 +1196,6 @@ class StockfishModel:
                 pass
         return decision
 
-def _stage_mult(stage: int) -> float:
-    """Pokemon stage multiplier for Atk/Def/SpA/SpD/Spe.
-    stage in [-6, +6]. Returns the standard (2+s)/2 for s>=0 else 2/(2-s).
-    """
-    try:
-        s = int(stage)
-    except Exception:
-        s = 0
-    if s >= 0:
-        return (2 + s) / 2
-    return 2 / (2 - s)
-
 # -------------- Poke-env Player wrapper ----------------
 try:
     from poke_env.player.player import Player  # type: ignore
@@ -1016,6 +1210,15 @@ class StockfishPokeEnvPlayer(Player):  # type: ignore[misc]
         try: self.engine.set_depth(int(engine_depth))
         except Exception: pass
         self._request_cache = {}
+        
+        # Add extended websocket timeout configuration to prevent disconnections
+        if 'ping_interval' not in kwargs:
+            kwargs['ping_interval'] = 60.0  # Send keepalive every 60 seconds (was 20s default)
+        if 'ping_timeout' not in kwargs:
+            kwargs['ping_timeout'] = 120.0  # Wait up to 2 minutes for ping response (was 20s default)
+        if 'open_timeout' not in kwargs:
+            kwargs['open_timeout'] = 30.0   # Wait up to 30 seconds for initial connection (was 10s default)
+        
         super().__init__(*args, **kwargs)
 
     def _build_request_signature(self, battle) -> tuple:

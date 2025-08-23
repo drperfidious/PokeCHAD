@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from .showdown_loader import ShowdownData
+import os
 
 log = logging.getLogger("typecalc")
 
@@ -82,6 +83,8 @@ class TypeCalc:
     def __init__(self, data: ShowdownData | None):
         self.data = data
         self._fallback = _matrix()
+        # Add type_chart property for RealBattleEngine compatibility
+        self.type_chart = self._fallback
 
     def move_type(self, move_id: str, is_terastallized: bool = False, attacker_tera_type: Optional[str] = None) -> Optional[str]:
         mid = move_id.lower()

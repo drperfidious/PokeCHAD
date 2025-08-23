@@ -26,6 +26,19 @@ _ALT_SHOWDOWN_CODE_TO_MULT = {0:1.0, 1:0.5, 2:2.0, 3:0.0}  # fallback if first m
 
 _DEF_CENTRIC_KEYS = {"DAMAGETAKEN","DAMAGE_TAKEN"}
 
+# New: canonical expectations used to score candidate matrices
+_EXPECTATIONS = [
+    ('Fire','Grass',2.0),
+    ('Fire','Water',0.5),
+    ('Water','Fire',2.0),
+    ('Dark','Fairy',0.5),
+    ('Fairy','Dark',2.0),
+    ('Fighting','Ghost',0.0),
+    ('Ghost','Normal',0.0),
+    ('Ground','Flying',0.0),
+    ('Electric','Ground',0.0),
+]
+
 def _looks_like_attack_matrix(tc: dict) -> bool:
     """Heuristic: treat as attack->defense matrix if each row is a dict of numeric multipliers within plausible range."""
     if not tc: return False
@@ -87,6 +100,8 @@ def _normalize_showdown_typechart(tc):
     atk_mat = { _to_title(a): {} for a in _CANON_TYPES }
     # We'll first collect raw codes per (atk,def) to allow adaptive mapping decision
     raw_codes = []  # list of (atk, def, code_int)
+    # Also collect attack-centric codes if the input is actually attack->def matrix of codes
+    raw_codes_attack_first = []  # list of (atk, def, code_int)
     for def_type, row in tc.items():
         D = _norm_type_name(def_type)
         if not D: continue
@@ -98,67 +113,61 @@ def _normalize_showdown_typechart(tc):
             if isinstance(v, dict) and k.upper() in _DEF_CENTRIC_KEYS:
                 dmg_row = v; break
         if dmg_row is None:
-            # Maybe row itself is the damageTaken dict
-            dmg_row = row if all(isinstance(x, (int,float)) for x in row.values()) else None
+            # Maybe row itself is the damageTaken dict (codes). We don't yet know orientation.
+            if all(isinstance(x, (int,float)) for x in row.values()):
+                dmg_row = row
+                # If this is actually attack-centric, then 'def_type' is attacker and keys are defender
+                for maybe_def, code in row.items():
+                    A = D  # attacker
+                    DD = _norm_type_name(maybe_def)
+                    if A in _CANON_TYPES and DD in _CANON_TYPES:
+                        try: raw_codes_attack_first.append((A, DD, int(code)))
+                        except Exception: raw_codes_attack_first.append((A, DD, 0))
         if not isinstance(dmg_row, dict):
             continue
+        # Interpret as defense-centric map: keys are attacker types
         for atk_type, code in dmg_row.items():
             A = _norm_type_name(atk_type)
             if not A: continue
-            # Only translate known types
-            if A not in _CANON_TYPES: continue
+            if A not in _CANON_TYPES or D not in _CANON_TYPES:
+                continue
             try:
                 code_int = int(code)
             except Exception:
                 code_int = 0
             raw_codes.append((A, D, code_int))
-    # Decide which code mapping fits expectations better
-    def build_matrix(code_map):
+    # Build matrices for both code maps and both orientations, pick best by expectations
+    def build_matrix(codes, code_map):
         m = { _to_title(a): {} for a in _CANON_TYPES }
-        for A,D,ci in raw_codes:
+        for A,D,ci in codes:
             if A in _CANON_TYPES and D in _CANON_TYPES:
                 m[_to_title(A)][_to_title(D)] = code_map.get(ci, 1.0)
         return m
-    cand1 = build_matrix(_SHOWDOWN_CODE_TO_MULT)
-    cand2 = build_matrix(_ALT_SHOWDOWN_CODE_TO_MULT)
-    # Expectation samples (atk,def,expected_mult)
-    expectations = [
-        ('Fire','Grass',2.0), ('Fire','Water',0.5), ('Water','Fire',2.0), ('Dark','Fairy',0.5), ('Fairy','Dark',2.0),
-        ('Fighting','Ghost',0.0), ('Ghost','Normal',0.0)
-    ]
+    cand_def_c1 = build_matrix(raw_codes, _SHOWDOWN_CODE_TO_MULT)
+    cand_def_c2 = build_matrix(raw_codes, _ALT_SHOWDOWN_CODE_TO_MULT)
+    cand_atk_c1 = build_matrix(raw_codes_attack_first, _SHOWDOWN_CODE_TO_MULT)
+    cand_atk_c2 = build_matrix(raw_codes_attack_first, _ALT_SHOWDOWN_CODE_TO_MULT)
+
     def score(mat):
         sc = 0
-        for a,d,exp in expectations:
+        for a,d,exp in _EXPECTATIONS:
             got = mat.get(a, {}).get(d)
             if got == exp: sc += 1
         return sc
-    if score(cand2) > score(cand1):
-        import logging; logging.getLogger('typecalc').info('Swapping to alternate typechart code mapping (detected inverted 1/2 codes).')
-        atk_mat = cand2
-    else:
-        atk_mat = cand1
+    candidates = [cand_def_c1, cand_def_c2, cand_atk_c1, cand_atk_c2]
+    scores = [score(c) for c in candidates]
+    best_idx = max(range(len(candidates)), key=lambda i: scores[i])
+    atk_mat = candidates[best_idx]
     # Drop empty rows
     out = { atk: row for atk, row in atk_mat.items() if any(v != 1.0 for v in row.values()) }
     if not out:
-        # If everything looked neutral (unlikely), fallback to atk_mat (retain structure)
         out = atk_mat
-    # Basic sanity check example: Fire vs Ground should be 1.0
+    # Sanity and final clamp
     try:
-        fg = out.get('Fire', {}).get('Ground')
-        # Evaluate expectations; if badly wrong, fallback to static
-        expectations = [
-            ('Dark','Fairy',0.5),('Fairy','Dark',2.0),('Fire','Grass',2.0),('Fire','Water',0.5),('Water','Fire',2.0),('Fighting','Ghost',0.0),('Ghost','Normal',0.0)
-        ]
-        ok = sum(1 for a,d,exp in expectations if out.get(a, {}).get(d) == exp)
-        if ok < len(expectations)-1:
-            import logging; logging.getLogger('typecalc').warning('Type chart mapping failed (%d/%d correct). Falling back to static canonical chart.', ok, len(expectations))
+        ok = sum(1 for a,d,exp in _EXPECTATIONS if out.get(a, {}).get(d) == exp)
+        if ok < len(_EXPECTATIONS) - 1:
+            import logging; logging.getLogger('typecalc').warning('Type chart mapping failed (%d/%d). Falling back to static canonical chart.', ok, len(_EXPECTATIONS))
             return _build_static_chart()
-        if fg and fg not in (0.0,0.25,0.5,1.0,2.0,4.0):
-            log.warning('Typechart anomaly Fire->Ground=%.3f (clamping)', fg)
-            out['Fire']['Ground'] = 1.0
-        if out.get('Fire', {}).get('Ground') == 2.0 and out.get('Ground', {}).get('Fire') in (0.5,1.0):
-            log.warning('Detected transposed weakness (Fire->Ground=2.0). Correcting to 1.0.')
-            out['Fire']['Ground'] = 1.0
     except Exception:
         pass
     return out
@@ -283,17 +292,19 @@ class MovesInfo:
         )
 
     def get_type_chart(self) -> Dict[str, Dict[str, float]]:
-        """Return a normalized, Title-case type chart with caching (falls back to Showdown).
-        If an older cached uppercase chart is detected, convert it on the fly.
-        Added: strict validation vs canonical expectations; on failure, use static chart.
-        You can force static via env POKECHAD_FORCE_STATIC_TYPECHART=1.
+        """Return a normalized, Title-case type chart with caching.
+        By default we now use the canonical static Gen 9 chart to avoid mis-parsing
+        dynamic sources that can flip weaknesses/resistances. To opt-in to dynamic
+        parsing (Showdown/poke-env), set POKECHAD_ENABLE_DYNAMIC_TYPECHART=1.
         """
         try:
-            import os
-            if os.getenv('POKECHAD_FORCE_STATIC_TYPECHART'):
+            import os, logging
+            # Prefer static unless explicitly enabled
+            if not os.getenv('POKECHAD_ENABLE_DYNAMIC_TYPECHART'):
                 tc = _build_static_chart()
                 setattr(self, '_type_chart_cache', tc)
                 return tc
+
             tc = getattr(self, "_type_chart_cache", None)
             if tc is None:
                 raw_tc = (
@@ -303,13 +314,10 @@ class MovesInfo:
                     or {}
                 )
                 tc = _normalize_showdown_typechart(raw_tc)
-                # Validate expectations
-                expectations = [
-                    ('Fire','Grass',2.0),('Fire','Water',0.5),('Water','Fire',2.0),('Dark','Fairy',0.5),('Fairy','Dark',2.0),('Fighting','Ghost',0.0),('Ghost','Normal',0.0)
-                ]
-                ok = sum(1 for a,d,exp in expectations if tc.get(a, {}).get(d) == exp)
-                if ok < len(expectations):
-                    import logging; logging.getLogger('typecalc').warning('Dynamic type chart failed validation (%d/%d). Using static canonical chart.', ok, len(expectations))
+                # Validate expectations (extended)
+                ok = sum(1 for a,d,exp in _EXPECTATIONS if tc.get(a, {}).get(d) == exp)
+                if ok < len(_EXPECTATIONS):
+                    logging.getLogger('typecalc').warning('Dynamic type chart failed validation (%d/%d). Using static canonical chart.', ok, len(_EXPECTATIONS))
                     tc = _build_static_chart()
                 setattr(self, "_type_chart_cache", tc)
             else:

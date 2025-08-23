@@ -49,19 +49,25 @@ def _extract_side_conditions(side) -> Dict[str, Any]:
         return out
 
     # poke-env represents side conditions via enums/sets; we use getattr defensively.
-    sconds = getattr(side, "conditions", None) or getattr(side, "side_conditions", None)
+    # Handle case where side is already a dict (newer poke-env versions)
+    if isinstance(side, dict):
+        sconds = side
+    else:
+        sconds = getattr(side, "conditions", None) or getattr(side, "side_conditions", None)
+    
     if isinstance(sconds, dict):
         # Newer poke-env stores counts for stackables
-        out["stealth_rock"] = bool(sconds.get("STEALTH_ROCK") or sconds.get("Stealth Rock"))
-        out["spikes"] = int(sconds.get("SPIKES") or sconds.get("Spikes") or 0)
-        out["toxic_spikes"] = int(sconds.get("TOXIC_SPIKES") or sconds.get("Toxic Spikes") or 0)
-        out["sticky_web"] = bool(sconds.get("STICKY_WEB") or sconds.get("Sticky Web"))
-        out["reflect"] = bool(sconds.get("REFLECT") or sconds.get("Reflect"))
-        out["light_screen"] = bool(sconds.get("LIGHT_SCREEN") or sconds.get("Light Screen"))
-        out["aurora_veil"] = bool(sconds.get("AURORA_VEIL") or sconds.get("Aurora Veil"))
-        out["tailwind"] = bool(sconds.get("TAILWIND") or sconds.get("Tailwind"))
-        out["safeguard"] = bool(sconds.get("SAFEGUARD") or sconds.get("Safeguard"))
-        out["mist"] = bool(sconds.get("MIST") or sconds.get("Mist"))
+        # Handle both uppercase enum keys and lowercase underscore keys
+        out["stealth_rock"] = bool(sconds.get("STEALTH_ROCK") or sconds.get("Stealth Rock") or sconds.get("stealth_rock"))
+        out["spikes"] = int(sconds.get("SPIKES") or sconds.get("Spikes") or sconds.get("spikes") or 0)
+        out["toxic_spikes"] = int(sconds.get("TOXIC_SPIKES") or sconds.get("Toxic Spikes") or sconds.get("toxic_spikes") or 0)
+        out["sticky_web"] = bool(sconds.get("STICKY_WEB") or sconds.get("Sticky Web") or sconds.get("sticky_web"))
+        out["reflect"] = bool(sconds.get("REFLECT") or sconds.get("Reflect") or sconds.get("reflect"))
+        out["light_screen"] = bool(sconds.get("LIGHT_SCREEN") or sconds.get("Light Screen") or sconds.get("light_screen"))
+        out["aurora_veil"] = bool(sconds.get("AURORA_VEIL") or sconds.get("Aurora Veil") or sconds.get("aurora_veil"))
+        out["tailwind"] = bool(sconds.get("TAILWIND") or sconds.get("Tailwind") or sconds.get("tailwind"))
+        out["safeguard"] = bool(sconds.get("SAFEGUARD") or sconds.get("Safeguard") or sconds.get("safeguard"))
+        out["mist"] = bool(sconds.get("MIST") or sconds.get("Mist") or sconds.get("mist"))
     else:
         # Very old poke-env
         for name in ("Stealth Rock", "Spikes", "Toxic Spikes", "Sticky Web",

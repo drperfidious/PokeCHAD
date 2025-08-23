@@ -256,6 +256,46 @@ def predict_order_for_ids(
     }
     return float(pred.user_first_probability), details
 
+def predict_first_prob_speed_only(
+    state: CombinedState,
+    my_key: str,
+    opp_key: str,
+    *,
+    my_tailwind: Optional[bool] = None,
+    opp_tailwind: Optional[bool] = None,
+) -> float:
+    """Compute P(user acts before opponent) using only effective Speed and Trick Room.
+
+    This ignores move priority and precedence, and is intended as a robust fallback
+    when full order prediction cannot be computed.
+    """
+    me = state.team.ours[my_key]
+    opp = state.team.opponent[opp_key]
+
+    # Ensure grounded flags are known (not strictly needed for speed, but cheap)
+    if me.grounded is None:
+        augment_grounded(me, {"gravity": state.field.gravity})
+    if opp.grounded is None:
+        augment_grounded(opp, {"gravity": state.field.gravity})
+
+    tw_my, tw_opp = _tailwind_flags(state.my_side, state.opp_side)
+    tw_my = tw_my if my_tailwind is None else my_tailwind
+    tw_opp = tw_opp if opp_tailwind is None else opp_tailwind
+
+    me_ctx = _speed_context_from_state(me, field=state.field, tailwind_active=tw_my)
+    opp_ctx = _speed_context_from_state(opp, field=state.field, tailwind_active=tw_opp)
+    me_speed = to_compute_speed(me_ctx)
+    opp_speed = to_compute_speed(opp_ctx)
+
+    # Trick Room: reverse ordering within bracket
+    trick_room = bool(getattr(state.field, "trick_room", False))
+    if me_speed == opp_speed:
+        return 0.5
+    if trick_room:
+        return 1.0 if me_speed < opp_speed else 0.0
+    else:
+        return 1.0 if me_speed > opp_speed else 0.0
+
 # ------------------------------ Damage -------------------------------------------
 
 def _apply_stat_side_modifiers(
@@ -298,6 +338,7 @@ def _combatant_from_state(
         types=[t.capitalize() for t in ps.types if t],
         atk=atk, def_=deff, spa=spa, spd=spd, spe=spe,
         tera_type=ps.tera_type.capitalize() if ps.tera_type else None,
+        terastallized=bool(getattr(ps, 'terastallized', False)),
         grounded=bool(ps.grounded if ps.grounded is not None else True),
         is_burned=(ps.status == "brn"),
         ability=(ps.ability or None),
@@ -360,6 +401,36 @@ def estimate_damage(
     # Type chart and helpers
     chart_fn = mi.get_type_chart
     dmg_field = _dm_field_from_env_field(state.field)
+    
+    # Check for ability-based immunities
+    defender_ability = (dfd.ability or '').lower()
+    move_type = (mv.type or '').lower()
+    
+    # Common immunity abilities
+    if defender_ability == 'waterabsorb' and move_type == 'water':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-waterabsorb"]}
+    elif defender_ability == 'voltabsorb' and move_type == 'electric':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-voltabsorb"]}
+    elif defender_ability == 'flashfire' and move_type == 'fire':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-flashfire"]}
+    elif defender_ability == 'sapsipper' and move_type == 'grass':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-sapsipper"]}
+    elif defender_ability == 'stormdrain' and move_type == 'water':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-stormdrain"]}
+    elif defender_ability == 'dryskin' and move_type == 'water':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-dryskin"]}
+    elif defender_ability == 'levitate' and move_type == 'ground':
+        return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-levitate"]}
+    elif defender_ability == 'wonderguard':
+        # Wonder Guard only allows super effective moves to hit
+        defender_types = getattr(dfd, 'types', []) or []
+        defender_terastallized = bool(getattr(dfd, 'terastallized', False))
+        defender_tera_type = getattr(dfd, 'tera_type', None)
+        temp_eff = type_effectiveness(move_type, defender_types, chart_fn(), 
+                                      defender_tera_type=defender_tera_type,
+                                      defender_terastallized=defender_terastallized)
+        if temp_eff <= 1.0:  # Not super effective
+            return {"min": 0, "max": 0, "rolls": [0], "effectiveness": 0.0, "mods": ["immunity-wonderguard"]}
 
     # Extra modifiers (Life Orb, Expert Belt, Muscle Band, Wise Glasses, type boosters, Technician, Sheer Force)
     extra: List[float] = []
@@ -647,3 +718,24 @@ def would_fail(
     except Exception:
         pass
     return False, "ok"
+
+def get_effective_speeds(
+    state: CombinedState,
+    my_key: str,
+    opp_key: str,
+    *,
+    my_tailwind: Optional[bool] = None,
+    opp_tailwind: Optional[bool] = None,
+) -> Tuple[int, int]:
+    """Return (my_effective_speed, opp_effective_speed) for the current field.
+
+    This uses full item/ability/status/boost modifiers known in state.
+    """
+    me = state.team.ours[my_key]
+    opp = state.team.opponent[opp_key]
+    tw_my, tw_opp = _tailwind_flags(state.my_side, state.opp_side)
+    tw_my = tw_my if my_tailwind is None else my_tailwind
+    tw_opp = tw_opp if opp_tailwind is None else opp_tailwind
+    me_ctx = _speed_context_from_state(me, field=state.field, tailwind_active=tw_my)
+    opp_ctx = _speed_context_from_state(opp, field=state.field, tailwind_active=tw_opp)
+    return to_compute_speed(me_ctx), to_compute_speed(opp_ctx)

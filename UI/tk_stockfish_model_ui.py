@@ -247,6 +247,13 @@ class StockfishWindow(tk.Toplevel):
 
         # --- Thinking tab
         think_tab = ttk.Frame(nb); nb.add(think_tab, text="Thinking")
+        # AI Status header (who's faster, picked move, brackets, notes)
+        status_frame = ttk.LabelFrame(think_tab, text="AI Status")
+        status_frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(6, 0))
+        self.ai_status_var = tk.StringVar(value="")
+        self.ai_status_label = ttk.Label(status_frame, textvariable=self.ai_status_var, anchor=tk.W)
+        self.ai_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
+
         self.cand_tree = self._make_cand_tree(think_tab, "Move candidates")
         self.switch_tree = self._make_switch_tree(think_tab, "Switch candidates")
 
@@ -604,7 +611,7 @@ class StockfishWindow(tk.Toplevel):
                     "snapshot": self._latest_snapshot,
                 }
                 with open(self._telemetry_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry) + "\n")
+                    f.write(json.dumps(entry, default=str) + "\n")
         except Exception as e:
             self._append_log(f"telemetry write failed: {e}")
 
@@ -613,6 +620,57 @@ class StockfishWindow(tk.Toplevel):
 
     def _refresh_thinking(self):
         if not self.winfo_exists(): return
+        # AI Status / Order summary
+        try:
+            picked = (self._latest_think.get("picked") or {}) if isinstance(self._latest_think, dict) else {}
+            order = self._latest_think.get("order") or {}
+            speed = self._latest_think.get("speed_meta") or {}
+            # Determine faster text
+            faster = "?"
+            me = speed.get('my_effective_speed'); opp = speed.get('opp_effective_speed')
+            tr = speed.get('trick_room')
+            if isinstance(me, int) and isinstance(opp, int):
+                if me == opp:
+                    faster = "tie"
+                elif tr:
+                    faster = "you" if me < opp else "opp"
+                else:
+                    faster = "you" if me > opp else "opp"
+            # Move picked
+            pick_txt = ""
+            if picked:
+                if picked.get('kind') == 'move':
+                    pick_txt = f"picked move: {picked.get('name') or picked.get('id')}"
+                elif picked.get('kind') == 'switch':
+                    pick_txt = f"picked switch: {picked.get('species')}"
+            # Brackets/notes
+            ub = order.get('user_bracket'); ob = order.get('opp_bracket')
+            notes = order.get('notes')
+            ufirst = order.get('p_user_first')
+            parts = []
+            if isinstance(me, int) and isinstance(opp, int):
+                parts.append(f"Spe {me} vs {opp}{' (TR)' if tr else ''} → {faster}")
+            if pick_txt:
+                parts.append(pick_txt)
+            if ufirst is not None:
+                try:
+                    parts.append(f"P(user first) {float(ufirst):.2f}")
+                except Exception:
+                    pass
+            if ub is not None and ob is not None:
+                parts.append(f"brackets: {ub} vs {ob}")
+            if notes:
+                try:
+                    if isinstance(notes, list):
+                        parts.append("; ".join(str(n) for n in notes[:2]))
+                    else:
+                        parts.append(str(notes))
+                except Exception:
+                    pass
+            self.ai_status_var.set(" | ".join(parts))
+        except Exception:
+            try: self.ai_status_var.set("")
+            except Exception: pass
         # Candidates
         self._reload_tree(self.cand_tree)
         for d in self._latest_think.get("candidates", []):

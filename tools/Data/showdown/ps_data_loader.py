@@ -105,15 +105,18 @@ def load_showdown_dir(root_dir: str) -> Dict[str, Dict[str, Any]]:
         return None
 
     items_p = find("items") or find("items.json")
-    abilities_p = find("abilities") or find("abilities.json")
+    abilities_p = find("abilities") or find("abilities.json")  
     moves_p = find("moves") or find("moves.json")
+    pokedex_p = find("pokedex") or find("pokedex.json")
 
-    dex = {"items": {}, "abilities": {}, "moves": {}}
+    dex = {"items": {}, "abilities": {}, "moves": {}, "pokedex": {}}
     if items_p:
         dex["items"] = _load_json(items_p)
     if abilities_p:
         dex["abilities"] = _load_json(abilities_p)
     if moves_p:
         dex["moves"] = _load_json(moves_p)
+    if pokedex_p:
+        dex["pokedex"] = _load_json(pokedex_p)
 
     return dex

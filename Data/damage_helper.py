@@ -23,6 +23,7 @@ this module to specific dex data.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -35,7 +36,11 @@ FP_BASE = 4096  # Showdown-style fixed point
 
 def to_fp(x: float) -> int:
     """Convert a float multiplier to fixed-point (rounded)."""
-    return int(round(x * FP_BASE))
+    # Handle tuple case (weather function returns tuple but should be unpacked)
+    if isinstance(x, (list, tuple)):
+        # This should only happen if weather_fn result wasn't unpacked correctly
+        x = x[0] if x else 1.0
+    return int(round(float(x) * FP_BASE))
 
 def chain_mul(base_fp: int, mods_fp: Iterable[int]) -> int:
     """Chain fixed-point multipliers with rounding down each step."""
@@ -64,6 +69,7 @@ class CombatantState:
 
     # Battle-time flags
     tera_type: Optional[str] = None
+    terastallized: bool = False
     grounded: bool = True
     is_burned: bool = False
 
@@ -163,7 +169,7 @@ def calc_damage_range(
     is_critical: bool = False,
     extra_modifiers: Optional[List[float]] = None,
     type_effectiveness_fn: Optional[Callable[[str, Sequence[str], Dict[str, Dict[str, float]], Optional[str]], float]] = None,
-    stab_fn: Optional[Callable[[str, Sequence[str], Optional[str], Optional[str]], float]] = None,
+    stab_fn: Optional[Callable[[str, Sequence[str], Optional[str], Optional[str], bool], float]] = None,
     weather_fn: Optional[Callable[[str, Optional[str], Optional[str]], Tuple[float, bool]]] = None,
     terrain_fn: Optional[Callable[[str, bool, bool, Optional[str]], float]] = None,
     screen_fn: Optional[Callable[[str, object, bool, bool, int], float]] = None,
@@ -180,10 +186,19 @@ def calc_damage_range(
     # Apply stat stages; crit ignores attacker's negative and defender's positive stages
     eff_atk = attacker.atk if is_physical else attacker.spa
     eff_def = defender.def_ if is_physical else defender.spd
-    eff_atk = apply_stage(eff_atk, attacker.atk_stage if is_physical else attacker.spa_stage,
-                          ignore_negative=is_critical)
-    eff_def = apply_stage(eff_def, defender.def_stage if is_physical else defender.spd_stage,
-                          ignore_positive=is_critical)
+    # Special case: Body Press uses user's Defense for the attacking stat
+    is_body_press = (move.move_id or '').lower() == 'bodypress'
+    if is_body_press:
+        # Use attacker's Defense with Defense stage as the attacking stat
+        eff_atk = attacker.def_
+        eff_atk = apply_stage(eff_atk, attacker.def_stage, ignore_negative=is_critical)
+        # Defender uses normal Defense with Defense stage (physical defense)
+        eff_def = apply_stage(eff_def, defender.def_stage, ignore_positive=is_critical)
+    else:
+        eff_atk = apply_stage(eff_atk, attacker.atk_stage if is_physical else attacker.spa_stage,
+                              ignore_negative=is_critical)
+        eff_def = apply_stage(eff_def, defender.def_stage if is_physical else defender.spd_stage,
+                              ignore_positive=is_critical)
 
     # Core base damage
     base = _base_damage(attacker.level, move.base_power, eff_atk, max(1, eff_def))
@@ -213,13 +228,20 @@ def calc_damage_range(
 
     # 5) STAB
     if stab_fn:
-        stab = stab_fn(move.type, attacker.types, attacker.tera_type, attacker.ability)
+        stab = stab_fn(
+            move.type,
+            attacker.types,
+            attacker.tera_type,
+            attacker.ability,
+            terastallized=attacker.terastallized,
+        )
         mods_fp.append(to_fp(stab))
 
     # 6) Type effectiveness
     type_chart = get_type_chart() if get_type_chart else {}
     if type_effectiveness_fn and type_chart:
-        eff = type_effectiveness_fn(move.type, defender.types, type_chart, move.move_id)
+        eff = type_effectiveness_fn(move.type, defender.types, type_chart, move.move_id, 
+                                    defender.tera_type, defender.terastallized)
     else:
         eff = 1.0
 

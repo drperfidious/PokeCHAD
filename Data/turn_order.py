@@ -308,8 +308,23 @@ def predict_order(
                                notes + [f"Higher priority bracket wins: {u_pri} vs {o_pri}."])
 
     # Same bracket: precedence effects (Quick Claw / Custap / Lagging Tail / Stall / Mycelium Might)
-    u_prec = precedence_from_effects(user_ability_id, user_item_id, {"category": user_action.move.category})
-    o_prec = precedence_from_effects(opp_ability_id, opp_item_id, {"category": opp_action.move.category})
+    # Precedence effects may depend on contextual flags (e.g., Custap Berry activation).
+    # We propagate a minimal move_ctx including category and any Custap activation boolean
+    # that may have been set on the SpeedContext by the caller.
+    u_move_ctx = {"category": user_action.move.category}
+    o_move_ctx = {"category": opp_action.move.category}
+    try:
+        if getattr(user_ctx, "custap_active", False):
+            u_move_ctx["custap_active"] = True
+    except Exception:
+        pass
+    try:
+        if getattr(opp_ctx, "custap_active", False):
+            o_move_ctx["custap_active"] = True
+    except Exception:
+        pass
+    u_prec = precedence_from_effects(user_ability_id, user_item_id, u_move_ctx)
+    o_prec = precedence_from_effects(opp_ability_id, opp_item_id, o_move_ctx)
 
     # Always-first/last overrides first
     if u_prec.always_first and not o_prec.always_first:
